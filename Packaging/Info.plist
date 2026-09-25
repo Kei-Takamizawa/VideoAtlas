@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS がアプリ情報として読み取る設定ファイルです。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- アプリ設定の最上位要素を開始します。 -->
+<plist version="1.0">
+<!-- 名前と実行ファイルなどの設定をまとめます。 -->
+<dict>
+    <!-- macOS がアプリを識別するための固有名です。 -->
+    <key>CFBundleIdentifier</key><string>local.videoatlas.app</string>
+    <!-- Finder とメニューバーへ表示する名前です。 -->
+    <key>CFBundleName</key><string>VideoAtlas</string>
+    <!-- 実行ファイルの名前を指定します。 -->
+    <key>CFBundleExecutable</key><string>VideoAtlas</string>
+    <!-- このバンドルがアプリであることを示します。 -->
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <!-- 初版のバージョン番号です。 -->
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <!-- 初版のビルド番号です。 -->
+    <key>CFBundleVersion</key><string>1</string>
+    <!-- Liquid Glass が利用できる macOS 26 を最小バージョンにします。 -->
+    <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <!-- 高解像度ディスプレイへ鮮明に描画します。 -->
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>

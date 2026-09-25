@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- OpenVINO の CPU 推論が生成する実行コードを許可します。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 署名権限の最上位要素です。 -->
+<plist version="1.0">
+<!-- 実行時の権限設定をまとめます。 -->
+<dict>
+    <!-- OpenVINO が機械語を動的に作成できるようにします。 -->
+    <key>com.apple.security.cs.allow-jit</key><true/>
+    <!-- OpenVINO 内部の実行メモリを利用できるようにします。 -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+    <!-- 付属の推論ライブラリを読み込めるようにします。 -->
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict>
+</plist>

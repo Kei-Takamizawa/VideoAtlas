@@ -1,0 +1,47 @@
+# macOS Finder metadata.
+.DS_Store
+
+# Swift Package Manager build output and caches.
+.build/
+.swiftpm/
+
+# Python virtual environments and bytecode caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local Python packaging and test outputs.
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Locally built app bundles and archives.
+dist/
+*.dmg
+*.pkg
+
+# Local development captures are not part of the public documentation.
+Screenshots/*development*.png
+
+# Local video files should never be added by accident.
+*.mp4
+*.mov
+*.m4v
+
+# Local indexes, generated thumbnails, and temporary data.
+*.sqlite
+*.sqlite3
+*.db
+Thumbnails/
+
+# Downloaded model asset, fetched by the setup script.
+videoatlas/resources/face_landmarker.task
+
+# Local validation outputs are not part of the public source tree.
+Validation/*.md
+Validation/*.json
