@@ -42,6 +42,14 @@ Thumbnails/
 # Downloaded model asset, fetched by the setup script.
 videoatlas/resources/face_landmarker.task
 
+# FACE01 weights stay local and retain their separate upstream license.
+videoatlas/resources/JAPANESE_FACE_*.onnx
+videoatlas/resources/FACE01-LICENSE.txt
+InferenceCache/
+*.engine
+*.profile
+*.timing
+
 # Local validation outputs are not part of the public source tree.
 Validation/*.md
 Validation/*.json

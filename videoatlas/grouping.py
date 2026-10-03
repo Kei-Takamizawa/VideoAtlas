@@ -27,6 +27,22 @@ if TYPE_CHECKING:
 NO_MATCH = math.inf
 
 
+# 旧OpenVINOモデルの照合基準を既存macOS索引と同じ値に保ちます。
+LEGACY_MODEL = "openvino:face-reidentification-retail-0095:v1"
+
+
+# モデルごとの保守的な既存人物照合距離を返します。
+def _match_threshold(model: str) -> float:
+    # macOSの従来モデルでは既存の距離基準を維持します。
+    return 0.25 if model == LEGACY_MODEL else 0.18
+
+
+# 次点候補と必要な距離差をモデルごとに返します。
+def _match_margin(model: str) -> float:
+    # macOSの従来モデルでは既存の競合判定を維持します。
+    return 0.05 if model == LEGACY_MODEL else 0.08
+
+
 # 二つの特徴量のコサイン距離を計算します。
 def _distance(left: list[float] | None, right: list[float] | None) -> float:
     # 片方が欠けるか次元が異なる場合は照合できません。
@@ -74,13 +90,13 @@ def _overlap(left: tuple[float, float, float, float] | None, right: tuple[float,
 
 
 # ある人物から比較に使う異なる顔向きの代表を最大八件選びます。
-def _add_representative(face: FaceRecord, representatives: dict[str, list[FaceRecord]]) -> None:
+def _add_representative(face: FaceRecord, representatives: dict[tuple[str, str], list[FaceRecord]]) -> None:
     # 除外顔、未分類顔、比較不能な顔は代表にできません。
-    if face.excluded or face.person_id is None or face.embedding is None:
+    if face.excluded or face.person_id is None or face.embedding is None or face.embedding_model is None:
         # 代表一覧を変えずに終わります。
         return
-    # 対象人物の現在の代表一覧を取得します。
-    examples = representatives.setdefault(face.person_id, [])
+    # 同じ人物でもモデルが異なる特徴量を別の代表一覧に分離します。
+    examples = representatives.setdefault((face.person_id, face.embedding_model), [])
     # 同じ顔を二度登録しません。
     if any(example.id == face.id for example in examples):
         # 既存の代表を維持します。
@@ -115,6 +131,10 @@ def _add_representative(face: FaceRecord, representatives: dict[str, list[FaceRe
 
 # 短時間で同じ場所に映り続けた人物の候補を計算します。
 def _temporal_score(previous: FaceRecord, sample: "FaceSample", maximum_gap: float) -> float:
+    # モデルまたは前処理が違う特徴量は同じ空間の距離として扱いません。
+    if previous.embedding_model is None or previous.embedding_model != sample.embedding_model:
+        # 位置が重なっても人物を追跡しません。
+        return NO_MATCH
     # 前の顔からの経過秒数を求めます。
     gap = sample.second - previous.second
     # 同時刻や長い空白をまたぐ顔は追跡しません。
@@ -130,7 +150,7 @@ def _temporal_score(previous: FaceRecord, sample: "FaceSample", maximum_gap: flo
     # 前後の顔特徴量を比較します。
     distance = _distance(previous.embedding, sample.embedding)
     # 特徴が大きく違う顔を位置だけで結びません。
-    if distance > 0.45:
+    if distance > (0.45 if sample.embedding_model == LEGACY_MODEL else 0.25):
         # 条件外の候補であることを返します。
         return NO_MATCH
     # 特徴、位置、時間差を合わせ、低い値を強い候補にします。
@@ -152,11 +172,11 @@ def _temporal_person(sample: "FaceSample", peers: list["FaceSample"], recent: di
     # 最もよく一致する候補の値と人物を取ります。
     best_score, best_id = candidates[0]
     # 次点との差が小さい場合は誤分類を避けます。
-    if len(candidates) > 1 and candidates[1][0] - best_score < 0.05:
+    if len(candidates) > 1 and candidates[1][0] - best_score < _match_margin(sample.embedding_model):
         # どちらの人物か分からないため未分類にします。
         return None
     # 同じフレームの別顔もその人物へ結び付きそうか調べます。
-    if any(peer is not sample and _temporal_score(recent[best_id], peer, maximum_gap) <= best_score + 0.05 for peer in peers):
+    if any(peer is not sample and _temporal_score(recent[best_id], peer, maximum_gap) <= best_score + _match_margin(sample.embedding_model) for peer in peers):
         # 同時出現する別人と一人を混ぜないようにします。
         return None
     # 一意に追跡できた人物のIDを返します。
@@ -164,17 +184,35 @@ def _temporal_person(sample: "FaceSample", peers: list["FaceSample"], recent: di
 
 
 # 特徴量と短時間追跡に矛盾がない場合だけ人物を割り当てます。
-def _cluster_person(sample: "FaceSample", representatives: dict[str, list[FaceRecord]], occupied: set[str], temporal_id: str | None, thumbnail_path: str, new_people: list[PersonRecord]) -> str | None:
+def _cluster_person(sample: "FaceSample", representatives: dict[tuple[str, str], list[FaceRecord]], occupied: set[str], temporal_id: str | None, thumbnail_path: str, new_people: list[PersonRecord]) -> str | None:
     # 特徴量を作れない顔は未分類に残します。
-    if sample.embedding is None:
+    if sample.embedding is None or sample.embedding_model is None:
         # 無理な人物推定は行いません。
         return None
-    # 各人物の最大八枚の代表顔から最短距離を求めます。
-    candidates = sorted((min(_distance(sample.embedding, face.embedding) for face in examples), person_id) for person_id, examples in representatives.items() if person_id not in occupied and examples)
-    # 慎重なしきい値に届かなかった人物を候補から除きます。
-    candidates = [candidate for candidate in candidates if candidate[0] <= 0.25]
+    # 同じ特徴量空間の人物代表だけを比較します。
+    candidates: list[tuple[float, str]] = []
+    # 人物ごとの代表顔を順に調べます。
+    for (person_id, model), examples in representatives.items():
+        # 同時出現人物と別モデルの代表は比較しません。
+        if model != sample.embedding_model or person_id in occupied:
+            # 次の人物へ進みます。
+            continue
+        # 各代表へのコサイン距離を近い順に並べます。
+        distances = sorted(_distance(sample.embedding, face.embedding) for face in examples)
+        # 一件も基準に届かない人物は候補にしません。
+        if not distances or distances[0] > _match_threshold(model):
+            # 次の人物へ進みます。
+            continue
+        # FACE01では異なる二枚の代表による裏付けを要求します。
+        if model != LEGACY_MODEL and (len(distances) < 2 or distances[1] > _match_threshold(model)):
+            # 単発の似た顔から既存人物へ結び付けません。
+            continue
+        # 同じモデルの十分な裏付けを得た候補を加えます。
+        candidates.append((distances[0], person_id))
+    # 上位二候補の差を評価できる順序にします。
+    candidates.sort()
     # 上位二候補の距離差が小さければ人物を決めません。
-    if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.05:
+    if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < _match_margin(sample.embedding_model):
         # 曖昧な顔を未分類として返します。
         return None
     # 代表顔から一人に絞れた場合を扱います。
@@ -212,7 +250,7 @@ def classify_faces(samples: list["FaceSample"], video: VideoRecord, existing_fac
     # 今回処理した区間の旧顔だけを置き換えます。
     old_region = [face for face in previous if lower <= face.second < upper]
     # 旧顔のIDを保存側へ削除対象として渡します。
-    removed_ids = [face.id for face in old_region]
+    removed_ids = [face.id for face in old_region if not face.manual_assignment and not face.excluded]
     # 顔が見つからない区間でも旧検出を消して再解析結果へ合わせます。
     if not samples:
         # 顔のない区間から人物は新しく作りません。
@@ -226,7 +264,7 @@ def classify_faces(samples: list["FaceSample"], video: VideoRecord, existing_fac
     # 実在する人物IDだけを自動分類の候補にします。
     existing_person_ids = {person.id for person in people}
     # 各人物の多様な代表顔を保持します。
-    representatives: dict[str, list[FaceRecord]] = {}
+    representatives: dict[tuple[str, str], list[FaceRecord]] = {}
     # 置き換え対象以外の分類済み顔から比較用代表を作ります。
     for face in existing_faces:
         # 有効な人物へ分類済みで、今回置き換えない顔を選びます。
@@ -235,10 +273,10 @@ def classify_faces(samples: list["FaceSample"], video: VideoRecord, existing_fac
             _add_representative(face, representatives)
     # 同じフレームで同一人物を二度割り当てないための索引です。
     occupied_by_frame: dict[int, set[str]] = defaultdict(set)
-    # 旧顔の手動分類を含めてフレームの占有情報を作ります。
+    # 再解析でも残す手動分類の占有情報を作ります。
     for face in old_region:
         # 除外されず人物が決まった旧顔だけを扱います。
-        if not face.excluded and face.person_id is not None:
+        if face.manual_assignment and not face.excluded and face.person_id is not None:
             # 旧顔が映ったフレームの人物を記録します。
             occupied_by_frame[round(face.second * 600)].add(face.person_id)
     # 同じ動画の直近フレームで見つけた人物を保持します。
@@ -274,9 +312,9 @@ def classify_faces(samples: list["FaceSample"], video: VideoRecord, existing_fac
         # 顔枠の重なりを主な基準に旧顔を順位付けします。
         matched = [(1.0 - _overlap(face.bounding_box, sample.bounding_box), face) for face in old_candidates if _overlap(face.bounding_box, sample.bounding_box) >= 0.3]
         # 旧形式で顔枠のない顔だけ特徴量で再利用を検討します。
-        matched.extend((1.0 + _distance(face.embedding, sample.embedding), face) for face in old_candidates if face.bounding_box is None and _distance(face.embedding, sample.embedding) <= 0.25)
+        matched.extend((1.0 + _distance(face.embedding, sample.embedding), face) for face in old_candidates if face.bounding_box is None and sample.embedding_model is not None and face.embedding_model == sample.embedding_model and _distance(face.embedding, sample.embedding) <= _match_threshold(sample.embedding_model))
         # スコアが同点でもFaceRecord同士を比較しないようキーを指定します。
-        reusable = min(matched, key=lambda item: item[0])[1] if matched else None
+        reusable = min(matched, key=lambda item: (not item[1].manual_assignment, item[0]))[1] if matched else None
         # 旧顔を再利用する場合はIDを保持します。
         identifier = reusable.id if reusable is not None else str(uuid4())
         # 同じ旧顔が次の検出顔に選ばれないよう記録します。
@@ -292,7 +330,7 @@ def classify_faces(samples: list["FaceSample"], video: VideoRecord, existing_fac
         # 手動変更済みを含む旧顔の人物割当をそのまま保持します。
         person_id = reusable.person_id if reusable is not None else _cluster_person(sample, representatives, occupied_by_frame[frame_key], temporal_id, str(image_path), new_people)
         # 今回の時刻、画像、人物割当を一件の顔レコードにします。
-        face = FaceRecord(id=identifier, video_id=video.id, second=sample.second, bounding_box=sample.bounding_box, person_id=person_id, thumbnail_path=str(image_path), embedding=sample.embedding, manual_assignment=reusable.manual_assignment if reusable is not None else False, excluded=reusable.excluded if reusable is not None else False)
+        face = FaceRecord(id=identifier, video_id=video.id, second=sample.second, bounding_box=sample.bounding_box, person_id=person_id, thumbnail_path=str(image_path), embedding=sample.embedding, manual_assignment=reusable.manual_assignment if reusable is not None else False, excluded=reusable.excluded if reusable is not None else False, embedding_model=sample.embedding_model, quality=sample.quality, rejection_reason=sample.rejection_reason)
         # 保存対象の顔一覧へ追加します。
         new_faces.append(face)
         # 割当が確かな顔だけ次の顔の候補へ加えます。
@@ -454,10 +492,15 @@ def _compare_groups(first: _Group, second: _Group) -> _Evidence | None:
 
 # 自動統合先を求め、元人物IDから統合先IDへの対応を返します。
 def reconcile_groups(faces: list[FaceRecord], videos: list[VideoRecord], people: list[PersonRecord]) -> dict[str, str]:
-    # 解析完了した動画だけを根拠にします。
-    ready_video_ids = {video.id for video in videos if video.state == "ready"}
+    # FACE01では閾値が実映像で未校正のため自動グループ統合を行いません。
+    # 従来モデルで解析完了した動画だけを根拠にします。
+    ready_video_ids = {video.id for video in videos if video.state == "ready" and video.embedding_model == LEGACY_MODEL}
     # 一件でも手動修正された人物グループ全体を保護します。
     protected_ids = {face.person_id for face in faces if face.manual_assignment and face.person_id is not None}
+    # 利用者が付けた人物名も自動統合では失わないよう保護します。
+    protected_ids.update(person.id for person in people if person.name.strip())
+    # FACE01由来の顔が属する人物へ旧モデルの統合を波及させません。
+    protected_ids.update(face.person_id for face in faces if face.person_id is not None and face.embedding_model != LEGACY_MODEL)
     # 実在する人物だけを候補にします。
     existing_ids = {person.id for person in people}
     # 候補となる顔を人物IDごとに集めます。
@@ -465,7 +508,7 @@ def reconcile_groups(faces: list[FaceRecord], videos: list[VideoRecord], people:
     # 顔の状態と人物IDを一件ずつ調べます。
     for face in faces:
         # 除外顔、未解析動画、手動群、特徴量なし、孤立した人物IDを除きます。
-        if not face.excluded and face.video_id in ready_video_ids and face.person_id in existing_ids and face.person_id not in protected_ids and face.embedding is not None:
+        if not face.excluded and face.video_id in ready_video_ids and face.person_id in existing_ids and face.person_id not in protected_ids and face.embedding is not None and face.embedding_model == LEGACY_MODEL:
             # この顔を人物の比較情報へ追加します。
             by_person[face.person_id].append(face)
     # 条件を満たした人物の比較用情報を保持します。

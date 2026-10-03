@@ -1,4 +1,4 @@
-# このファイルはPython版VideoAtlasのmacOS向け画面を定義します。
+# このファイルはPython版VideoAtlasのmacOS・Windows向け画面を定義します。
 """PySide6 で作る VideoAtlas のライブラリ画面。"""
 
 # 起動時の保存先指定を読み取ります。
@@ -25,6 +25,8 @@ from .controller import LibraryController
 from .localization import load_language, localize_message, set_language, tr
 # 顔、人物、動画の型を画面表示に使います。
 from .storage import FaceRecord, PersonRecord, VideoRecord
+# Windowsの顔解析設定を推論エンジンを起動せずに読み込みます。
+from .recognition import RecognitionOptions
 
 
 # 画面全体の色、余白、文字を一箇所で定義します。
@@ -419,6 +421,10 @@ class MainWindow(QMainWindow):
         self._build_header()
         # 解析状況の表示欄を作ります。
         self._build_status()
+        # WindowsではGPUの使用方法と精度優先度を選べる欄を追加します。
+        if sys.platform == "win32":
+            # macOSの既存画面はそのまま使います。
+            self._build_acceleration_settings()
         # 一覧を配置するスクロール枠を作ります。
         self.scroller = QScrollArea()
         # ウィンドウの幅に合わせて中身を広げます。
@@ -594,6 +600,54 @@ class MainWindow(QMainWindow):
         self.content_layout.addWidget(self.status_frame)
 
     # サイドバーの選択を変更します。
+    def _build_acceleration_settings(self) -> None:
+        # GPU設定の選択と実際の使用方式を別々に表示します。
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        choices = QHBoxLayout()
+        self.acceleration_label = QLabel(tr("顔解析の高速化"))
+        choices.addWidget(self.acceleration_label)
+        self.acceleration_combo = QComboBox()
+        # 保存用のコードは表示言語を変えても維持します。
+        for text, value in (("自動（TensorRT → CUDA → CPU）", "auto"), ("TensorRT", "tensorrt"), ("CUDA", "cuda"), ("CPU", "cpu")):
+            self.acceleration_combo.addItem(tr(text), value)
+        choices.addWidget(self.acceleration_combo)
+        self.precision_combo = QComboBox()
+        self.precision_combo.addItem(tr("精度優先（FP32）"), "accurate")
+        self.precision_combo.addItem(tr("高速優先（TensorRT FP16）"), "balanced")
+        choices.addWidget(self.precision_combo)
+        choices.addStretch()
+        layout.addLayout(choices)
+        self.runtime_label = QLabel(tr("使用方式は解析開始時に表示します。"))
+        self.runtime_label.setWordWrap(True)
+        layout.addWidget(self.runtime_label)
+        self.content_layout.addWidget(panel)
+        # 不正な設定を画面の初期化中に上書きせず、解析時のエラーに残します。
+        try:
+            path = self.model.recognition_config_path
+            options = RecognitionOptions.load(path if path.is_file() else None)
+            self.acceleration_combo.setCurrentIndex(max(0, self.acceleration_combo.findData(options.acceleration)))
+            self.precision_combo.setCurrentIndex(max(0, self.precision_combo.findData(options.precision)))
+        except (OSError, ValueError, TypeError) as error:
+            self.runtime_label.setText(str(error))
+        # 初期値を設定し終えてから保存処理をつなぎます。
+        self.acceleration_combo.currentIndexChanged.connect(self._change_acceleration)
+        self.precision_combo.currentIndexChanged.connect(self._change_precision)
+
+    # 選んだ高速化方式を次回解析用に保存します。
+    def _change_acceleration(self, index: int) -> None:
+        value = self.acceleration_combo.itemData(index)
+        if value in {"auto", "tensorrt", "cuda", "cpu"}:
+            self.model.set_acceleration(value)
+
+    # FP32とFP16を選んだ結果はモデル識別子にも反映されます。
+    def _change_precision(self, index: int) -> None:
+        value = self.precision_combo.itemData(index)
+        if value in {"accurate", "balanced"}:
+            self.model.set_precision(value)
+
+    # サイドバーの選択を変更します。
     def _select_section(self, section: str, source_id: str | None = None) -> None:
         # 全動画、人物、登録フォルダのいずれかを保存します。
         self.section = section
@@ -632,6 +686,12 @@ class MainWindow(QMainWindow):
         self.language_combo.setItemText(1, tr("英語"))
         # 検索欄の説明を更新します。
         self.search.setPlaceholderText(tr("動画名・パスを検索"))
+        # WindowsのGPU設定も表示言語に合わせます。
+        if hasattr(self, "acceleration_combo"):
+            self.acceleration_label.setText(tr("顔解析の高速化"))
+            self.acceleration_combo.setItemText(0, tr("自動（TensorRT → CUDA → CPU）"))
+            self.precision_combo.setItemText(0, tr("精度優先（FP32）"))
+            self.precision_combo.setItemText(1, tr("高速優先（TensorRT FP16）"))
         # カードや人物結果を選択した言語で作り直します。
         self._render()
 
@@ -1022,6 +1082,12 @@ class MainWindow(QMainWindow):
         self.action_button.setText(tr("一時停止") if self.model.is_scanning else tr("フォルダを更新"))
         # 実行中の索引消去を止めます。
         self.clear_button.setEnabled(not self.model.is_scanning)
+        # 解析中の設定変更を防ぎ、実際のGPU・CPU選択を残して表示します。
+        if hasattr(self, "acceleration_combo"):
+            self.acceleration_combo.setEnabled(not self.model.is_scanning)
+            self.precision_combo.setEnabled(not self.model.is_scanning)
+            if self.model.runtime_description:
+                self.runtime_label.setText(localize_message(self.model.runtime_description))
 
     # 元フォルダを登録解除するメニューです。
     def _folder_menu(self, button: QPushButton, point: object, source_id: str) -> None:

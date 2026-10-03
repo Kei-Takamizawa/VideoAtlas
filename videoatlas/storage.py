@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 import json
 # os.walkはシンボリックリンクを追跡しない再帰列挙に使います。
 import os
+# OSごとの標準アプリデータ保存先を選ぶために使います。
+import sys
 # sqlite3はアプリ内蔵のSQLiteデータベース接続を提供します。
 import sqlite3
 # pathlibはパスの結合とファイル判定を読みやすくします。
@@ -51,6 +53,8 @@ class VideoRecord:
     error_message: str | None
     # 生成済みポスター画像のパスです。
     poster_path: str | None
+    # この動画を最後に解析した顔特徴量のモデルと前処理の識別子です。
+    embedding_model: str | None = "openvino:face-reidentification-retail-0095:v1"
 
 
 # 動画から見つかった顔と人物割当を保持します。
@@ -74,6 +78,12 @@ class FaceRecord:
     manual_assignment: bool
     # 顔を人物一覧や集計から除外するかを表します。
     excluded: bool
+    # 旧JSONの顔特徴量は従来のOpenVINOモデル由来として隔離します。
+    embedding_model: str | None = "openvino:face-reidentification-retail-0095:v1"
+    # 解析時に得た顔品質の0～1の値です。旧JSONは品質不明です。
+    quality: float | None = None
+    # 特徴量を作れなかった理由です。旧JSONでは理由を記録していません。
+    rejection_reason: str | None = None
 
 
 # 人物の名前と代表画像を保持します。
@@ -110,8 +120,8 @@ class LibraryStoreError(RuntimeError):
 class LibraryStore:
     # 保存先を受け取り、接続とテーブルを準備します。
     def __init__(self, root: Path | None = None) -> None:
-        # root省略時はユーザーのApplication Support配下を使います。
-        base = Path.home() / "Library" / "Application Support" / "VideoAtlasPython" if root is None else Path(root)
+        # root省略時はOSの標準アプリデータ領域を使い、既存macOS索引の場所を守ります。
+        base = self._default_root() if root is None else Path(root)
         # 保存先ディレクトリがなければ作成します。
         base.mkdir(parents=True, exist_ok=True)
         # データベースファイルを保存先ディレクトリ内に決めます。
@@ -126,6 +136,20 @@ class LibraryStore:
         self._connection.execute("PRAGMA journal_mode = WAL")
         # 必要なテーブルが存在する状態を作ります。
         self._create_tables()
+
+    # OSごとにアプリの永続データディレクトリを選びます。
+    @staticmethod
+    def _default_root() -> Path:
+        # macOSでは従来の保存場所を変更しません。
+        if sys.platform == "darwin":
+            # 既存のlibrary.sqlite3をそのまま再利用します。
+            return Path.home() / "Library" / "Application Support" / "VideoAtlasPython"
+        # Windowsではユーザーのローカルアプリデータを優先します。
+        if os.name == "nt":
+            # 環境変数がない特殊環境では標準のユーザーディレクトリへ戻します。
+            return Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or Path.home() / "AppData" / "Local") / "VideoAtlasPython"
+        # LinuxではXDGの指定を優先します。
+        return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "VideoAtlasPython"
 
     # テーブル定義を一度に作成します。
     def _create_tables(self) -> None:

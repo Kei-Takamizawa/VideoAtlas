@@ -8,6 +8,13 @@ from PySide6.QtCore import QSettings
 
 # 日本語の原文をキーにして対応する英語を一か所で管理します。
 ENGLISH: dict[str, str] = {
+    # Windowsの高速化設定を英語でも表示します。
+    "顔解析の高速化": "Face analysis acceleration",
+    "自動（TensorRT → CUDA → CPU）": "Auto (TensorRT → CUDA → CPU)",
+    "精度優先（FP32）": "Accuracy first (FP32)",
+    "高速優先（TensorRT FP16）": "Speed first (TensorRT FP16)",
+    "使用方式は解析開始時に表示します。": "The active runtime appears when analysis starts.",
+    "顔解析の高速化設定を保存しました。次の解析から適用します。": "Saved face analysis settings. They apply to the next analysis.",
     # 「新しい人物に分割」を英語でも表示できるようにします。
     "新しい人物に分割": "Split into a new person",
     # 「未分類へ戻す」を英語でも表示できるようにします。

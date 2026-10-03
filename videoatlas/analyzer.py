@@ -10,6 +10,12 @@ from typing import Callable, Iterator
 import numpy as np
 # 動画フレーム取得と Haar 顔検出に OpenCV を使います。
 import cv2
+import hashlib
+import os
+import sys
+import threading
+
+from .recognition import RecognitionOptions, default_config_path
 
 # 一つの顔の検出情報と任意の照合特徴量を保持します。
 @dataclass
@@ -22,6 +28,12 @@ class FaceSample:
     thumbnail_jpeg: bytes
     # 有効な整列画像から計算できた場合にだけ特徴量を保持します。
     embedding: list[float] | None
+    # 特徴量を作ったモデルと前処理の識別子です。
+    embedding_model: str | None = None
+    # 画像品質を0～1で表します。
+    quality: float = 1.0
+    # 特徴量を作れなかった場合の理由です。
+    rejection_reason: str | None = None
 
 # 最大 60 サンプル分の処理結果と再開位置を保持します。
 @dataclass
@@ -38,7 +50,7 @@ class AnalysisChunk:
     cancelled: bool
 
 # 動画からフレーム、顔領域、顔特徴量を順番に生成します。
-class VideoAnalyzer:
+class _LegacyVideoAnalyzer:
     # 通常解析のフレーム長辺上限をピクセルで定義します。
     _MAX_DIMENSION = 1280
     # ひとつの永続化単位に含めるサンプル数を定義します。
@@ -358,3 +370,387 @@ class VideoAnalyzer:
             raise RuntimeError(f"Expected 256 embedding values, got {embedding.size}")
         # Python float のリストとして公開 API へ返します。
         return embedding.tolist()
+
+
+_SESSION_CACHE: dict[tuple[object, ...], tuple[object, object, object, bool, str]] = {}
+_SESSION_CACHE_LOCK = threading.Lock()
+_FACE01_PREPROCESSING = "face01-rgb224-nchw-imagenet-align5-v2"
+_FACE01_MODEL_NAME = "JAPANESE_FACE_V1.onnx"
+_FACE01_MODEL_SHA256 = "e7ca51f4bc85f73ddb830683ac6a09077909fa45a52b2bff41a9c6e8ff267e2f"
+
+
+class _Face01VideoAnalyzer:
+    """Windows FACE01 analyzer with original-resolution landmark alignment."""
+
+    _CHUNK_SIZE = 60
+
+    def __init__(self, options: RecognitionOptions) -> None:
+        options.validate()
+        self.options = options
+        self._closed = False
+        model_path = Path(options.model_path).expanduser()
+        if not model_path.is_file():
+            raise FileNotFoundError(
+                f"FACE01 model is missing: {model_path}. Place JAPANESE_FACE_V1.onnx there; "
+                "the application does not download model files automatically."
+            )
+        self.model_path = model_path.resolve()
+        digest = hashlib.sha256()
+        with self.model_path.open("rb") as model_file:
+            for block in iter(lambda: model_file.read(1024 * 1024), b""):
+                digest.update(block)
+        self.model_sha256 = digest.hexdigest()
+        default_model = Path(__file__).parent / "resources" / _FACE01_MODEL_NAME
+        if self.model_path == default_model.resolve() and self.model_sha256 != _FACE01_MODEL_SHA256:
+            raise RuntimeError(f"FACE01 model checksum mismatch for {self.model_path}")
+        self.embedding_model = f"face01:{self.model_sha256}:{_FACE01_PREPROCESSING}"
+        self._dll_directory_handle = None
+        if options.tensorrt_dll_dir is not None:
+            dll_dir = Path(options.tensorrt_dll_dir).expanduser()
+            if not dll_dir.is_dir():
+                raise FileNotFoundError(f"TensorRT DLL directory does not exist: {dll_dir}")
+            if hasattr(os, "add_dll_directory"):
+                self._dll_directory_handle = os.add_dll_directory(str(dll_dir))
+        self._session, self._input, self._output, self._dynamic_batch, provider_report = self._load_session()
+        self.runtime_description = provider_report
+        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        self._detector = cv2.CascadeClassifier(str(cascade_path))
+        if self._detector.empty():
+            raise RuntimeError(f"OpenCV face detector could not be loaded: {cascade_path}")
+        try:
+            import mediapipe as mp
+        except ImportError as error:
+            raise RuntimeError("Python package 'mediapipe' is required for face landmarks") from error
+        task_path = Path(__file__).parent / "resources" / "face_landmarker.task"
+        if not task_path.is_file():
+            raise FileNotFoundError(f"MediaPipe FaceLandmarker task model is missing: {task_path}")
+        task_options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=str(task_path)),
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            num_faces=20,
+        )
+        self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(task_options)
+        self._mp = mp
+
+    def _load_session(self) -> tuple[object, object, object, bool, str]:
+        try:
+            import onnxruntime as ort
+        except ImportError as error:
+            raise RuntimeError("Python package 'onnxruntime-gpu' is required for FACE01") from error
+        available = set(ort.get_available_providers())
+        preload_note = ""
+        if sys.platform == "win32" and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls(directory=str(self.options.tensorrt_dll_dir) if self.options.tensorrt_dll_dir else None)
+            except Exception as error:
+                preload_note = f"GPU DLL preload unavailable: {error}"
+        requested = self.options.acceleration
+        if requested == "cpu":
+            provider_names = ["CPUExecutionProvider"]
+        elif requested == "cuda":
+            provider_names = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        elif requested == "tensorrt":
+            provider_names = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            provider_names = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        if sys.platform != "win32" and requested in {"auto", "cuda", "tensorrt"}:
+            provider_names = [name for name in provider_names if name == "CPUExecutionProvider"]
+        unavailable = [name for name in provider_names if name != "CPUExecutionProvider" and name not in available]
+        provider_names = [name for name in provider_names if name in available]
+        if not provider_names or provider_names[-1] != "CPUExecutionProvider":
+            provider_names.append("CPUExecutionProvider")
+        cache_root = self.options.cache_dir or (default_config_path().parent / "InferenceCache")
+        cache_root.mkdir(parents=True, exist_ok=True)
+        version = getattr(ort, "__version__", "unknown")
+        cache_key = (str(self.model_path), self.model_sha256, version, tuple(provider_names), self.options.gpu_device_id, self.options.threads, self.options.precision)
+        with _SESSION_CACHE_LOCK:
+            cached = _SESSION_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            failures: list[str] = []
+            candidate_lists: list[list[object]] = []
+            if "TensorrtExecutionProvider" in provider_names:
+                trt_cache = self._safe_tensorrt_cache(cache_root, version)
+                balanced = self.options.precision == "balanced"
+                trt_options = {"device_id": str(self.options.gpu_device_id), "trt_engine_cache_enable": "1" if trt_cache else "0", "trt_fp16_enable": "1" if balanced else "0", "trt_use_tf32": "1" if balanced else "0", "trt_max_workspace_size": str(1024 * 1024 * 1024), "trt_engine_cache_prefix": f"face01-{self.model_sha256[:16]}-{self.options.precision}"}
+                if trt_cache is not None:
+                    trt_options["trt_engine_cache_path"] = str(trt_cache)
+                candidate_lists.append([("TensorrtExecutionProvider", trt_options), ("CUDAExecutionProvider", {"device_id": str(self.options.gpu_device_id)}), "CPUExecutionProvider"])
+            if "CUDAExecutionProvider" in provider_names:
+                candidate_lists.append([("CUDAExecutionProvider", {"device_id": str(self.options.gpu_device_id)}), "CPUExecutionProvider"])
+            candidate_lists.append(["CPUExecutionProvider"])
+            seen: set[str] = set()
+            for providers in candidate_lists:
+                label = ",".join(str(item[0] if isinstance(item, tuple) else item) for item in providers)
+                if label in seen:
+                    continue
+                seen.add(label)
+                try:
+                    session_options = ort.SessionOptions()
+                    session_options.intra_op_num_threads = self.options.threads
+                    session_options.inter_op_num_threads = 1
+                    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                    session = ort.InferenceSession(str(self.model_path), sess_options=session_options, providers=providers)
+                    model_input = session.get_inputs()[0]
+                    model_output = session.get_outputs()[0]
+                    if len(model_input.shape) != 4 or tuple(model_input.shape[-3:]) != (3, 224, 224):
+                        raise RuntimeError(f"FACE01 input must have NCHW shape [N, 3, 224, 224], got {model_input.shape}")
+                    if len(model_output.shape) < 2 or model_output.shape[-1] not in (256, "256", None):
+                        raise RuntimeError(f"FACE01 output must end in 256 values, got {model_output.shape}")
+                    batch_dim = model_input.shape[0] if len(model_input.shape) == 4 else 1
+                    dynamic_batch = batch_dim is None or isinstance(batch_dim, str)
+                    if not dynamic_batch and batch_dim != 1:
+                        raise RuntimeError(f"FACE01 static batch size must be 1 or dynamic, got {batch_dim}")
+                    actual = ", ".join(session.get_providers())
+                    report = f"FACE01 ONNX Runtime {version}; active providers: {actual}"
+                    if unavailable:
+                        report += "; unavailable providers: " + ", ".join(unavailable)
+                    if preload_note:
+                        report += f"; {preload_note}"
+                    if failures:
+                        report += "; provider fallback: " + " | ".join(failures)
+                    result = (session, model_input, model_output, dynamic_batch, report)
+                    _SESSION_CACHE[cache_key] = result
+                    return result
+                except Exception as error:
+                    failures.append(f"{label}: {error}")
+            raise RuntimeError("Could not create FACE01 inference session: " + " | ".join(failures))
+
+    def _safe_tensorrt_cache(self, cache_root: Path, ort_version: str) -> Path | None:
+        """Only persist compiled engines when runtime and adapter identity are known."""
+        try:
+            import importlib.metadata
+            import subprocess
+
+            trt_version = importlib.metadata.version("tensorrt")
+            result = subprocess.run(
+                ["nvidia-smi", "--id", str(self.options.gpu_device_id), "--query-gpu=uuid,driver_version", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            identity = result.stdout.strip().replace(", ", "-").replace(" ", "")
+            if not identity or "GPU-" not in identity:
+                return None
+            key = f"trt-{self.model_sha256[:16]}-ort{ort_version}-trt{trt_version}-gpu{identity}-p{self.options.precision}"
+            return cache_root / key
+        except Exception:
+            return None
+
+    def iter_chunks(self, video_path: Path, interval: float, start: float = 0, end: float | None = None, stop: Callable[[], bool] | None = None, progress: Callable[[float, float], None] | None = None) -> Iterator[AnalysisChunk]:
+        if not np.isfinite(interval) or interval <= 0:
+            raise ValueError("interval must be a finite number greater than zero")
+        if not np.isfinite(start) or start < 0:
+            raise ValueError("start must be a finite number greater than or equal to zero")
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            capture.release()
+            raise ValueError(f"Cannot open video stream: {video_path}")
+        try:
+            frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+            fps = capture.get(cv2.CAP_PROP_FPS)
+            if not np.isfinite(fps) or fps <= 0 or not np.isfinite(frame_count) or frame_count <= 0:
+                raise ValueError(f"Cannot read a valid video stream: {video_path}")
+            duration = float(frame_count / fps)
+            final_second = min(duration, duration if end is None else float(end))
+            if final_second <= start and start < duration:
+                raise ValueError("end must be greater than start")
+            requested = min(float(start), duration)
+            capture.set(cv2.CAP_PROP_POS_MSEC, requested * 1000.0)
+            faces: list[FaceSample] = []
+            chunk_frames = 0
+            poster: bytes | None = None
+            completed = requested
+            cancelled = False
+            previous_frame_index = max(0, int(requested * fps)) - 1
+            while requested < final_second:
+                if chunk_frames >= self._CHUNK_SIZE:
+                    yield AnalysisChunk(duration, poster, faces, completed, False)
+                    faces, chunk_frames, poster = [], 0, None
+                if stop is not None and stop():
+                    cancelled = True
+                    break
+                target_index = max(0, int(round(requested * fps)))
+                gap = target_index - previous_frame_index
+                if 0 < gap <= max(2, int(fps * 1.25)):
+                    if gap == 1:
+                        success, original_frame = capture.read()
+                    else:
+                        for _ in range(gap - 1):
+                            if not capture.grab():
+                                break
+                        success, original_frame = capture.retrieve()
+                else:
+                    capture.set(cv2.CAP_PROP_POS_MSEC, requested * 1000.0)
+                    success, original_frame = capture.read()
+                if not success or original_frame is None:
+                    raise ValueError(f"Could not extract frame at {requested:.2f}s from {video_path}")
+                previous_frame_index = target_index
+                actual_ms = capture.get(cv2.CAP_PROP_POS_MSEC)
+                actual_second = actual_ms / 1000.0 if np.isfinite(actual_ms) and actual_ms > 0 else requested
+                chunk_frames += 1
+                frame_h, frame_w = original_frame.shape[:2]
+                detect_frame = original_frame
+                max_dimension = self.options.detection_max_dimension
+                if max(frame_h, frame_w) > max_dimension:
+                    scale = max_dimension / max(frame_h, frame_w)
+                    detect_frame = cv2.resize(original_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                if poster is None:
+                    poster = _LegacyVideoAnalyzer._encode_jpeg(detect_frame, 75)
+                rgb = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB)
+                result = self._landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb))
+                candidates: list[tuple[tuple[int, int, int, int], object | None]] = []
+                if result.face_landmarks:
+                    for landmarks in result.face_landmarks:
+                        xs = [point.x for point in landmarks if np.isfinite(point.x)]
+                        ys = [point.y for point in landmarks if np.isfinite(point.y)]
+                        if not xs or not ys:
+                            continue
+                        x0, y0 = max(0, int(min(xs) * frame_w)), max(0, int(min(ys) * frame_h))
+                        x1, y1 = min(frame_w, int(max(xs) * frame_w) + 1), min(frame_h, int(max(ys) * frame_h) + 1)
+                        candidates.append(((x0, y0, x1, y1), landmarks))
+                else:
+                    gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+                    boxes = self._detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
+                    scale_x, scale_y = frame_w / detect_frame.shape[1], frame_h / detect_frame.shape[0]
+                    for x, y, width, height in boxes:
+                        box = (int(x * scale_x), int(y * scale_y), int((x + width) * scale_x), int((y + height) * scale_y))
+                        candidates.append((box, None))
+                prepared: list[tuple[tuple[int, int, int, int], bytes, np.ndarray | None, float, str | None]] = []
+                for box, landmarks in candidates:
+                    x0, y0, x1, y1 = box
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    crop = original_frame[y0:y1, x0:x1]
+                    thumb = _LegacyVideoAnalyzer._encode_jpeg(crop, 80)
+                    if landmarks is None:
+                        prepared.append((box, thumb, None, 0.0, "haar_fallback_unclassified"))
+                        continue
+                    aligned, quality, reason = self._align_and_quality(original_frame, landmarks, box)
+                    prepared.append((box, thumb, aligned, quality, reason))
+                valid = [item for item in prepared if item[2] is not None]
+                embeddings = self._infer_batch([item[2] for item in valid]) if valid else []
+                embedding_index = 0
+                for box, thumb, aligned, quality, reason in prepared:
+                    embedding = None
+                    if aligned is not None:
+                        embedding = embeddings[embedding_index]
+                        embedding_index += 1
+                    x0, y0, x1, y1 = box
+                    faces.append(FaceSample(actual_second, (x0 / frame_w, y0 / frame_h, (x1 - x0) / frame_w, (y1 - y0) / frame_h), thumb, embedding, self.embedding_model if embedding is not None else None, quality, reason))
+                completed = min(requested + interval, final_second)
+                if progress is not None:
+                    progress(completed, duration)
+                requested += interval
+            if faces or cancelled or completed >= final_second:
+                yield AnalysisChunk(duration, poster, faces, completed, cancelled)
+        finally:
+            capture.release()
+
+    def _align_and_quality(self, frame: np.ndarray, landmarks: list, box: tuple[int, int, int, int]) -> tuple[np.ndarray | None, float, str | None]:
+        x0, y0, x1, y1 = box
+        width, height = x1 - x0, y1 - y0
+        if min(width, height) < self.options.min_face_size:
+            return None, 0.0, "face_too_small"
+        try:
+            source = np.asarray([[landmarks[index].x * frame.shape[1], landmarks[index].y * frame.shape[0]] for index in (263, 362, 33, 133, 2)], dtype=np.float32)
+        except (IndexError, AttributeError, TypeError):
+            return None, 0.0, "landmarks_missing"
+        if source.shape != (5, 2) or not np.isfinite(source).all():
+            return None, 0.0, "landmarks_non_finite"
+        eye_gap = float(np.linalg.norm(source[0] - source[2]))
+        if eye_gap < max(12.0, width * 0.12):
+            return None, 0.0, "eye_distance_invalid"
+        eye_midpoint = (source[0] + source[2]) * 0.5
+        yaw_ratio = abs(float(source[4, 0] - eye_midpoint[0])) / max(eye_gap, 1.0)
+        if yaw_ratio > 0.48:
+            return None, 0.0, "pose_yaw_out_of_range"
+        raw_template = np.asarray([[0.8595674595992, 0.2134981538014], [0.6460604764104, 0.2289674387677], [0.1205750620789, 0.2137274526848], [0.3340850613712, 0.2290642403242], [0.4901123135679, 0.6277975316475]], dtype=np.float32)
+        destination = (raw_template + 0.1) / 1.2 * 224.0
+        transform, _ = cv2.estimateAffinePartial2D(source, destination, method=cv2.LMEDS)
+        if transform is None or not np.isfinite(transform).all():
+            return None, 0.0, "alignment_failed"
+        residual_points = cv2.transform(source[None, :, :], transform)[0]
+        residual = float(np.sqrt(np.mean(np.sum((residual_points - destination) ** 2, axis=1))))
+        if not np.isfinite(residual) or residual > 24.0:
+            return None, 0.0, "alignment_residual_high"
+        aligned_bgr = cv2.warpAffine(frame, transform, (224, 224), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(127, 127, 127))
+        gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        brightness = float(np.mean(gray))
+        saturation = float(np.mean(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)[:, :, 1]))
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if brightness < 18 or brightness > 242:
+            return None, 0.0, "brightness_out_of_range"
+        if saturation > 250:
+            return None, 0.0, "saturation_out_of_range"
+        if blur < 12.0:
+            return None, 0.0, "blur_too_high"
+        blur_score = min(1.0, blur / 180.0)
+        light_score = max(0.0, 1.0 - abs(brightness - 128.0) / 150.0)
+        pose_score = max(0.0, 1.0 - yaw_ratio / 0.6)
+        align_score = max(0.0, 1.0 - residual / 32.0)
+        quality = float(np.clip(0.30 * blur_score + 0.20 * light_score + 0.25 * pose_score + 0.25 * align_score, 0.0, 1.0))
+        rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
+        chw = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
+        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+        return ((chw - mean) / std).astype(np.float32), quality, None
+
+    def _infer_batch(self, tensors: list[np.ndarray]) -> list[list[float]]:
+        if not tensors:
+            return []
+        input_name = self._input.name
+        if self._dynamic_batch:
+            rows = []
+            for offset in range(0, len(tensors), 8):
+                batch = np.stack(tensors[offset : offset + 8]).astype(np.float32)
+                outputs = self._session.run([self._output.name], {input_name: batch})[0]
+                rows.extend(np.asarray(outputs, dtype=np.float32).reshape(len(batch), -1))
+            vectors = np.asarray(rows, dtype=np.float32).reshape(len(tensors), -1)
+        else:
+            rows = [self._session.run([self._output.name], {input_name: tensor[None, ...].astype(np.float32)})[0] for tensor in tensors]
+            vectors = np.asarray(rows, dtype=np.float32).reshape(len(tensors), -1)
+        if vectors.shape[1] != 256 or not np.isfinite(vectors).all():
+            raise RuntimeError(f"FACE01 produced invalid embeddings with shape {vectors.shape}")
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        if np.any(norms <= 1e-12) or not np.isfinite(norms).all():
+            raise RuntimeError("FACE01 produced a zero or non-finite embedding")
+        vectors = vectors / norms
+        return vectors.astype(np.float32).tolist()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._landmarker.close()
+            self._closed = True
+
+
+class VideoAnalyzer:
+    """Platform-selected analyzer; Darwin keeps the original OpenVINO path."""
+
+    def __init__(self, model_xml: Path | None = None, options: RecognitionOptions | None = None) -> None:
+        config = default_config_path()
+        self.options = options or RecognitionOptions.load(config if config.is_file() else None)
+        self.options.validate()
+        if self.options.backend == "openvino":
+            legacy_path = Path(model_xml) if model_xml is not None else Path(__file__).resolve().parents[1] / "Sources" / "VideoAtlas" / "Resources" / "Models" / "face-reidentification-retail-0095.xml"
+            self._implementation = _LegacyVideoAnalyzer(legacy_path)
+            self.embedding_model = "openvino:face-reidentification-retail-0095:v1"
+            self.runtime_description = "OpenVINO CPU; legacy 128x128 BGR alignment"
+        else:
+            self._implementation = _Face01VideoAnalyzer(self.options)
+            self.embedding_model = self._implementation.embedding_model
+            self.runtime_description = self._implementation.runtime_description
+
+    def iter_chunks(self, video_path: Path, interval: float, start: float = 0, end: float | None = None, stop: Callable[[], bool] | None = None, progress: Callable[[float, float], None] | None = None) -> Iterator[AnalysisChunk]:
+        for chunk in self._implementation.iter_chunks(video_path, interval, start, end, stop, progress):
+            if self.options.backend == "openvino":
+                for face in chunk.faces:
+                    if face.embedding is not None:
+                        face.embedding_model = self.embedding_model
+            yield chunk
+
+    def close(self) -> None:
+        close = getattr(self._implementation, "close", None)
+        if close is not None:
+            close()

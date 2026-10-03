@@ -3,6 +3,10 @@
 
 # 既存レコードを安全に複製するために使います。
 from dataclasses import replace
+# 認識設定の既存項目を保持したまま高速化設定を書き換えます。
+import json
+# macOSの従来索引に不要な解析器初期化を避けるために使います。
+import sys
 # 動画ファイルと保存先の場所を扱います。
 from pathlib import Path
 # 解析停止と保存完了の通知をスレッド間で共有します。
@@ -15,6 +19,8 @@ from PySide6.QtCore import QCoreApplication, QObject, QThread, Signal, Slot
 
 # 動画解析の結果を人物に慎重に割り当てる関数です。
 from .grouping import classify_faces, reconcile_groups
+# 既存macOSデータのモデル識別子を判定します。
+from .grouping import LEGACY_MODEL
 # SQLite に保存するデータ型とファイル列挙を読み込みます。
 from .storage import FaceRecord, LibraryStore, PersonRecord, SourceFolder, VideoRecord, list_video_files
 
@@ -35,17 +41,23 @@ class AnalysisWorker(QThread):
     video_error = Signal(str, str)
     # 必要な解析エンジンを開けない失敗を伝えます。
     fatal_error = Signal(str)
+    # 初期化済みモデルの識別子と実行方法を画面へ知らせます。
+    model_ready = Signal(str, str)
 
     # 解析対象と停止指示を保存します。
-    def __init__(self, videos: list[VideoRecord], stop_event: Event) -> None:
+    def __init__(self, videos: list[VideoRecord], stop_event: Event, config_path: Path) -> None:
         # Qt スレッドの内部状態を初期化します。
         super().__init__()
         # 画面側の書き換えに影響されない動画の写しを保持します。
         self.videos = [replace(video) for video in videos]
         # 一時停止を受け取る共有イベントを保持します。
         self.stop_event = stop_event
+        # 設定ファイルの場所を解析スレッドへ渡します。
+        self.config_path = config_path
         # 一区間の保存完了を待つイベントを用意します。
         self.chunk_saved = Event()
+        # モデル移行状態を画面スレッドで保存し終えるまで待ちます。
+        self.model_accepted = Event()
 
     # 一つずつ動画を開き、区間単位の結果を送ります。
     def run(self) -> None:
@@ -53,20 +65,51 @@ class AnalysisWorker(QThread):
         try:
             # 解析モジュールを動画処理の時だけ読み込みます。
             from .analyzer import VideoAnalyzer
-            # 顔特徴量用の OpenVINO モデルを渡します。
-            analyzer = VideoAnalyzer(MODEL_XML)
+            # 利用者が選んだ認識モデルと実行方法を読み込みます。
+            from .recognition import RecognitionOptions
+            # 顔特徴量用モデルと認識設定で解析器を初期化します。
+            analyzer = VideoAnalyzer(MODEL_XML, options=RecognitionOptions.load(self.config_path if self.config_path.is_file() else None))
         # 依存ライブラリが不足した場合は未処理動画を残します。
         except Exception as error:
             # 画面に必要な追加設定を説明します。
             self.fatal_error.emit(str(error))
             # 準備できない状態で動画へ進みません。
             return
-        # 登録済みの未処理動画を順に扱います。
+        # モデルが使える状態になってから旧索引の再解析状態を更新します。
+        self.model_ready.emit(analyzer.embedding_model, analyzer.runtime_description)
+        # 画面スレッドがモデル移行の状態を永続化するのを待ちます。
+        self.model_accepted.wait()
+        # 推論器を最後に解放できるよう処理全体を保護します。
+        try:
+            # 登録済みの未処理動画と旧モデルの完了動画を順に扱います。
+            self._run_videos(analyzer)
+        # 処理成功・中断・動画エラーのいずれでも推論資源を解放します。
+        finally:
+            # GPU・CPUの推論器を明示的に閉じます。
+            analyzer.close()
+
+    # モデルが異なる動画だけ先頭から、同じモデルの途中動画は続きから解析します。
+    def _run_videos(self, analyzer: object) -> None:
+        # 登録済みの候補動画を順に調べます。
         for video in self.videos:
             # 一時停止されたら次の動画は開きません。
             if self.stop_event.is_set():
                 # 完了処理へ進みます。
                 break
+            # 完了済みでモデルも同じ動画は解析しません。
+            if video.state == "ready" and video.embedding_model == analyzer.embedding_model:
+                # 次の動画へ進みます。
+                continue
+            # 失敗・欠落動画は利用者の明示的な再解析まで保留します。
+            if video.state not in {"pending", "ready"}:
+                # 現在の動画を解析対象にしません。
+                continue
+            # モデルや前処理が変わった動画は古い再開位置を使いません。
+            if video.embedding_model != analyzer.embedding_model:
+                # 旧モデルの顔は画面側で手動修正を保って置換します。
+                video.last_analyzed_second = 0.0
+                # 新モデルの特徴量識別子を設定します。
+                video.embedding_model = analyzer.embedding_model
             # 一件を開始したことを通知します。
             self.video_started.emit(video.id)
             # 動画ごとの失敗を次の動画へ持ち越さないようにします。
@@ -108,6 +151,12 @@ class LibraryController(QObject):
         self.thumbnail_dir = self.store.database_path.parent / "Thumbnails"
         # 生成画像を置くフォルダを作ります。
         self.thumbnail_dir.mkdir(parents=True, exist_ok=True)
+        # 認識設定は既存索引と同じアプリデータディレクトリへ置きます。
+        self.recognition_config_path = self.store.database_path.parent / "recognition.json"
+        # 実行中のCPU/GPU方式は解析器の初期化後に取得します。
+        self.runtime_description = ""
+        # 最後に初期化した顔特徴量モデルの識別子です。
+        self.active_embedding_model: str | None = None
         # 登録フォルダの画面用一覧です。
         self.sources: list[SourceFolder] = []
         # 動画の画面用一覧です。
@@ -256,14 +305,8 @@ class LibraryController(QObject):
                     continue
                 # 内容が変わったかサイズと更新日時で判定します。
                 changed = current.file_size != info.st_size or current.modification_time != info.st_mtime
-                # 内容が変わった場合は以前の顔とポスターを破棄します。
+                # 内容が変わった場合は手動修正を残して先頭から解析します。
                 if changed:
-                    # 旧動画から生成した画像を安全な保存先だけで削除します。
-                    self._remove_video_images(current.id)
-                    # 保存済みの顔を動画IDで削除します。
-                    for face in [face for face in self.faces if face.video_id == current.id]:
-                        # 旧内容の顔レコードを削除します。
-                        self.store.delete_face(face.id)
                     # 解析を先頭からやり直します。
                     current.last_analyzed_second = 0.0
                     # 古い長さを表示しません。
@@ -299,8 +342,12 @@ class LibraryController(QObject):
         if self.is_scanning:
             # 現在の解析を続けます。
             return
-        # 対象になる動画を現在の順番で選びます。
-        pending = [video for video in self.videos if video.state == "pending"]
+        # 新規動画とモデル移行の候補になる完了動画を選びます。
+        pending = [video for video in self.videos if video.state in {"pending", "ready"}]
+        # macOSの既存モデルだけが揃う場合は従来どおり再解析しません。
+        if sys.platform == "darwin" and not self.recognition_config_path.exists() and not any(video.state == "pending" or video.embedding_model != LEGACY_MODEL for video in pending):
+            # モデルファイルを再度開かずに画面へ戻ります。
+            return
         # 待機動画がなければ画面を変えません。
         if not pending:
             # 作業を始めずに戻ります。
@@ -316,7 +363,9 @@ class LibraryController(QObject):
         # 解析中の表示に切り替えます。
         self.is_scanning = True
         # 解析スレッドを作ります。
-        self.worker = AnalysisWorker(pending, self.stop_event)
+        self.worker = AnalysisWorker(pending, self.stop_event, self.recognition_config_path)
+        # 初期化が成功したモデルについてのみ旧索引の再解析を準備します。
+        self.worker.model_ready.connect(self._model_ready)
         # 動画開始通知を画面スレッドで処理します。
         self.worker.video_started.connect(self._video_started)
         # 一区間の結果を画面スレッドで保存します。
@@ -330,9 +379,130 @@ class LibraryController(QObject):
         # 全件処理後に表示を戻します。
         self.worker.finished.connect(self._scan_finished)
         # 最初の状態文を表示します。
-        self._status(f"解析を開始します（{len(pending)}件）", 0.0)
+        self._status(f"解析モデルを確認しています（候補{len(pending)}件）", 0.0)
         # Qt のバックグラウンド処理を開始します。
         self.worker.start()
+
+    # モデルが起動できた時点で異なる特徴量の動画だけ再解析待ちへ移します。
+    @Slot(str, str)
+    def _model_ready(self, model: str, runtime: str) -> None:
+        # ワーカーの保存待ちを例外時にも確実に解除します。
+        try:
+            # モデルと実際の実行方法を画面表示用に保持します。
+            self.active_embedding_model = model
+            # CPU・CUDA・TensorRTなど解析器が選んだ方法を記録します。
+            self.runtime_description = runtime
+            # この走査で実際に処理する件数を数えます。
+            count = 0
+            # 旧モデルから先頭へ戻す件数を別に数えます。
+            migration_count = 0
+            # 準備済み候補の状態を一件ずつ確かめます。
+            for video in self.videos:
+                # 欠落・失敗動画は自動で再試行しません。
+                if video.state not in {"pending", "ready"}:
+                    # 次の動画へ進みます。
+                    continue
+                # 前処理またはモデルが変わったときだけ再開位置を破棄します。
+                migration = video.embedding_model != model
+                # 再解析待ちまたは移行対象だけを数えます。
+                if video.state == "pending" or migration:
+                    # 一件を今回の進捗に含めます。
+                    count += 1
+                # 異なるモデルの完了索引を再解析待ちにします。
+                if migration:
+                    # 利用者へ移行件数を明示できるよう数えます。
+                    migration_count += 1
+                    # 旧モデルの途中位置を新モデルに使いません。
+                    video.last_analyzed_second = 0.0
+                    # 人の手動修正を残したまま先頭から再解析します。
+                    video.state = "pending"
+                    # 新しい解析結果の識別子を動画に記録します。
+                    video.embedding_model = model
+                    # この更新はモデル初期化が成功した後だけ行います。
+                    self.store.save_video(video)
+            # 完了済み動画のモデル移行も進捗に含めます。
+            self.scan_total = count
+            # 実行方法と移行件数を画面へ知らせます。
+            self._status(f"{runtime}：旧モデルの動画{migration_count}件を先頭から再解析します（解析対象{count}件）。" if migration_count else (f"{runtime}：{count}件を解析します。" if count else f"{runtime}：解析済みのモデルを確認しました。"), 0.0 if count else 1.0)
+            # 再解析待ちになったカードを更新します。
+            self.changed.emit()
+        # 画面側の例外で解析スレッドが待ち続けないようにします。
+        except Exception as error:
+            # 保存できなければ不整合のまま解析を進めません。
+            self.stop_event.set()
+            # 利用者へ原因を表示します。
+            self.scan_failure_message = f"モデル移行を保存できません：{error}"
+            # 失敗状態を画面へ伝えます。
+            self._status(self.scan_failure_message)
+        # 保存の成否に関わらずワーカーを待機状態から解除します。
+        finally:
+            # 現在のワーカーだけに確認完了を通知します。
+            if self.worker is not None:
+                # モデル初期化後の待機を終えます。
+                self.worker.model_accepted.set()
+
+    # 次回の走査で使うWindowsの認識実行方法を保存します。
+    def set_acceleration(self, acceleration: str) -> bool:
+        # 作業中に設定を書き換えると表示と実行方式が食い違います。
+        if self.is_scanning:
+            # 停止後の設定変更を促します。
+            self._status("解析を一時停止してから高速化設定を変更してください。")
+            # 設定変更の失敗を呼び出し側へ返します。
+            return False
+        # 認識器が受け付ける実行方式だけ保存します。
+        if acceleration not in {"auto", "cuda", "tensorrt", "cpu"}:
+            # 不明な値を設定ファイルに書き込みません。
+            return False
+        # 既存の他の認識項目を維持して高速化設定だけ保存します。
+        return self._save_recognition_setting("acceleration", acceleration)
+
+    # 次回の走査で使う認識精度と速度の設定を保存します。
+    def set_precision(self, precision: str) -> bool:
+        # 解析中は既に選ばれたモデルの一貫性を守ります。
+        if self.is_scanning:
+            # 一時停止してから変更できることを示します。
+            self._status("解析を一時停止してから認識設定を変更してください。")
+            # 設定を変更しません。
+            return False
+        # 用意した二つの推論設定だけ受け付けます。
+        if precision not in {"accurate", "balanced"}:
+            # 未知の値は保存しません。
+            return False
+        # 他の設定を残して精度設定だけ保存します。
+        return self._save_recognition_setting("precision", precision)
+
+    # 一つの認識設定を既存JSONへ安全に追加または更新します。
+    def _save_recognition_setting(self, name: str, value: str) -> bool:
+        # 元ファイルは置換成功まで保持します。
+        temporary = self.recognition_config_path.with_name(f"recognition-{uuid4().hex}.tmp")
+        # 読み書きの失敗をUIへ説明します。
+        try:
+            # 既存設定がある場合は他の項目を保持して読み込みます。
+            values = json.loads(self.recognition_config_path.read_text(encoding="utf-8")) if self.recognition_config_path.exists() else {}
+            # 設定の最上位はJSONオブジェクトだけ許します。
+            if not isinstance(values, dict):
+                # 既存設定を壊さないように停止します。
+                raise ValueError("認識設定はJSONオブジェクトである必要があります")
+            # 今回選んだ設定値だけを変更します。
+            values[name] = value
+            # 一時ファイルへUnicodeを保ったJSONを書き込みます。
+            temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            # 同じディレクトリ内の原子的な置換で保存します。
+            temporary.replace(self.recognition_config_path)
+        # 不正なJSONやI/O失敗を明確に知らせます。
+        except (OSError, ValueError, TypeError) as error:
+            # 元の設定を保持したまま理由を表示します。
+            self._status(f"認識設定を保存できません：{error}")
+            # 失敗を呼び出し側へ返します。
+            return False
+        # 残った一時ファイルだけ後片付けします。
+        finally:
+            # 保存に失敗した場合も不要ファイルを残しません。
+            temporary.unlink(missing_ok=True)
+        # 次回の解析器初期化から選択を使います。
+        self._status("顔解析の高速化設定を保存しました。次の解析から適用します。" if name == "acceleration" else "顔解析の精度設定を保存しました。次の解析から適用します。")
+        # 正常保存を呼び出し側へ返します。
+        return True
 
     # 停止指示を次の安全な保存区間で反映します。
     def pause_scanning(self) -> None:
