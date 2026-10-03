@@ -1,7 +1,8 @@
-# 画面を起動する関数を読み込みます。
-from .ui import main
+import sys
 
-# このパッケージが直接実行された場合だけ画面を開きます。
+if sys.platform != "win32":
+    raise SystemExit("VideoAtlas requires Windows 10 or 11.")
+
+from .ui import main
 if __name__ == "__main__":
-    # Qtアプリの終了番号をOSへ返します。
     raise SystemExit(main())

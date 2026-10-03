@@ -1,16 +1,13 @@
 """Download pinned local face models without importing or running the app."""
 
-# ダウンロード先や引数を扱う標準ライブラリだけを使います。
 import argparse
 import hashlib
 from pathlib import Path
 import tempfile
 from urllib.request import urlopen
 
-# 研究開発用に確認した FACE01_DEV の版を固定します。
 REVISION = "afec7ebac709f14224353e7f8b6539711899b1ff"
 BASE = f"https://raw.githubusercontent.com/yKesamaru/FACE01_DEV/{REVISION}"
-# モデルごとの出所・容量・SHA-256を固定し、別の重みへのすり替わりを防ぎます。
 ASSETS = (
     ("JAPANESE_FACE_V1.onnx", f"{BASE}/face01lib/models/JAPANESE_FACE_V1.onnx", 26083027,
      "e7ca51f4bc85f73ddb830683ac6a09077909fa45a52b2bff41a9c6e8ff267e2f"),
@@ -19,7 +16,6 @@ ASSETS = (
 )
 
 
-# 途中のダウンロードを完成品に見せず、完全なファイルだけを置き換えます。
 def download(url: str, destination: Path, size: int | None = None, digest: str | None = None) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -45,7 +41,6 @@ def download(url: str, destination: Path, size: int | None = None, digest: str |
             temporary.unlink(missing_ok=True)
 
 
-# macOS・WindowsのどちらでもPythonだけで初回取得を行えます。
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parents[1] / "videoatlas" / "resources")
@@ -59,6 +54,5 @@ def main() -> int:
     return 0
 
 
-# 直接指定されたときだけ取得処理を始めます。
 if __name__ == "__main__":
     raise SystemExit(main())

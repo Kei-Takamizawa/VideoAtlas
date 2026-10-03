@@ -1,0 +1,2 @@
+-r requirements-python.txt
+onnxruntime==1.22.0

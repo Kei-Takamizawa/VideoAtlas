@@ -1,0 +1,2 @@
+-r requirements-python.txt
+onnxruntime-gpu[cuda,cudnn]==1.22.0

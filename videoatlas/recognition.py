@@ -1,26 +1,15 @@
-"""Runtime configuration for local face recognition."""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 import json
 import os
 from pathlib import Path
-import sys
 from typing import Any
-
-
-def _default_backend() -> str:
-    if sys.platform == "darwin":
-        return "openvino"
-    return "face01"
 
 
 @dataclass(frozen=True)
 class RecognitionOptions:
-    """Validated runtime settings; values can be overridden in a JSON file."""
-
-    backend: str = field(default_factory=_default_backend)
+    backend: str = "face01"
     model_path: Path = Path(__file__).resolve().parent / "resources" / "JAPANESE_FACE_V1.onnx"
     acceleration: str = "auto"
     precision: str = "accurate"
@@ -33,57 +22,51 @@ class RecognitionOptions:
 
     @classmethod
     def load(cls, config_path: Path | None = None) -> "RecognitionOptions":
-        """Load optional JSON settings over platform defaults without network access."""
         defaults = cls()
-        path = Path(config_path).expanduser() if config_path is not None else None
-        if path is None or not path.is_file():
-            if path is not None:
-                raise FileNotFoundError(f"Recognition config file does not exist: {path}")
+        if config_path is None:
             return defaults
+        path = Path(config_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"Recognition config file does not exist: {path}")
         try:
             raw: Any = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Cannot read recognition config {path}: {error}") from error
         if not isinstance(raw, dict):
             raise ValueError("Recognition config must be a JSON object")
-        allowed = {item.name for item in fields(cls)}
-        unknown = sorted(set(raw) - allowed)
+        unknown = sorted(set(raw) - {item.name for item in fields(cls)})
         if unknown:
             raise ValueError(f"Unknown recognition config key(s): {', '.join(unknown)}")
         values = dict(raw)
-        if "model_path" in values:
-            values["model_path"] = Path(values["model_path"]).expanduser()
-        if values.get("cache_dir") is not None:
-            values["cache_dir"] = Path(values["cache_dir"]).expanduser()
-        if values.get("tensorrt_dll_dir") is not None:
-            values["tensorrt_dll_dir"] = Path(values["tensorrt_dll_dir"]).expanduser()
+        for name in ("model_path", "cache_dir", "tensorrt_dll_dir"):
+            if name in values and values[name] is not None:
+                if not isinstance(values[name], str) or not values[name].strip():
+                    raise ValueError(f"{name} must be a nonempty path string")
+                configured_path = Path(values[name]).expanduser()
+                values[name] = configured_path if configured_path.is_absolute() else path.parent / configured_path
         options = cls(**{**defaults.__dict__, **values})
         options.validate()
         return options
 
     def validate(self) -> None:
-        if self.backend not in {"face01", "openvino"}:
-            raise ValueError("backend must be 'face01' or 'openvino'")
+        if self.backend != "face01":
+            raise ValueError("backend must be 'face01'")
         if self.acceleration not in {"auto", "cpu", "cuda", "tensorrt"}:
             raise ValueError("acceleration must be 'auto', 'cpu', 'cuda', or 'tensorrt'")
         if self.precision not in {"accurate", "balanced"}:
             raise ValueError("precision must be 'accurate' or 'balanced'")
-        if not 1 <= self.threads <= 8:
-            raise ValueError("threads must be between 1 and 8")
-        if not 320 <= self.detection_max_dimension <= 4096:
-            raise ValueError("detection_max_dimension must be between 320 and 4096")
-        if not 40 <= self.min_face_size <= 512:
-            raise ValueError("min_face_size must be between 40 and 512")
-        if self.gpu_device_id < 0:
-            raise ValueError("gpu_device_id must be zero or greater")
+        ranges = {"threads": (1, 8), "detection_max_dimension": (320, 4096), "min_face_size": (40, 512), "gpu_device_id": (0, 255)}
+        for name, (minimum, maximum) in ranges.items():
+            value = getattr(self, name)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+        if not isinstance(self.model_path, Path):
+            raise ValueError("model_path must be a path")
+        for name in ("cache_dir", "tensorrt_dll_dir"):
+            if getattr(self, name) is not None and not isinstance(getattr(self, name), Path):
+                raise ValueError(f"{name} must be a path or null")
 
 
 def default_config_path() -> Path:
-    """Return the optional per-user recognition settings file."""
-    if sys.platform == "darwin":
-        root = Path.home() / "Library" / "Application Support" / "VideoAtlasPython"
-    elif os.name == "nt":
-        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "VideoAtlasPython"
-    else:
-        root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "VideoAtlasPython"
+    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "VideoAtlasPython"
     return root / "recognition.json"
