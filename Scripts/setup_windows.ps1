@@ -1,4 +1,4 @@
-param([switch]$Gpu)
+param([switch]$Gpu, [switch]$AdaFace)
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -31,6 +31,14 @@ try {
 
     & $VenvPython Scripts\download_face01.py
     if ($LASTEXITCODE -ne 0) { throw 'Could not download and verify the face models.' }
+
+    if ($AdaFace) {
+        & $VenvPython -m pip install -r requirements-adaface.txt
+        if ($LASTEXITCODE -ne 0) { throw 'Could not install the optional AdaFace exporter dependencies.' }
+        & $VenvPython Scripts\setup_adaface.py
+        if ($LASTEXITCODE -ne 0) { throw 'Could not download, verify, and export AdaFace.' }
+        Write-Host 'AdaFace is ready. Enable it in Settings and choose videoatlas\resources\adaface_ir50_ms1mv2.onnx.'
+    }
 
     Write-Host 'Setup finished. Start VideoAtlas with Scripts\run_windows.cmd.'
 }

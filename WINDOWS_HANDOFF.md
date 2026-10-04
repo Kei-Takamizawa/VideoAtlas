@@ -1,13 +1,17 @@
 # Windows development notes
 
-VideoAtlas targets 64-bit Windows. Follow [Windows setup](docs/WINDOWS_SETUP.md) for CPU or NVIDIA installation.
+Follow the authoritative [design specification](docs/design-specification.md). The dated [implementation status](docs/IMPLEMENTATION_STATUS.md) separates implemented features, verified checks, and remaining evaluation work.
 
-- FACE01 supplies the face embeddings; downloaded weights retain their separate model terms.
-- Accurate precision uses CUDA FP32 with TF32 disabled, then CPU. TensorRT requests use this fallback.
-- Balanced precision allows TensorRT FP16, CUDA TF32, then CPU.
-- Embeddings and resume positions are separated by model, preprocessing, and numerical profile.
-- Reanalysis preserves manual assignments and exclusions.
-- Provider registration does not establish that every model operation executes on the GPU.
-- Matching thresholds are provisional. No recognition accuracy or speed measurements are claimed.
+VideoAtlas targets 64-bit Windows and Python 3.12. Follow [Windows setup](docs/WINDOWS_SETUP.md) for CPU, optional NVIDIA acceleration, and optional AdaFace provisioning. The public repository excludes downloaded weights, checkpoints, face caches, test clips, and the user's private Japanese specification.
 
-Implementation was reviewed by reading the source. Tests, Python imports, compilation, app launches, and video benchmarks were not performed at the user's request. Future verification requires suitable video samples and explicit authorization.
+The current engine uses SCRFD landmarks, model-specific FACE01/AdaFace alignment and normalization, and versioned embedding spaces. Numerical GPU/CPU profiles remain separate. Track decisions aggregate multiple quality-filtered samples, and automatic clustering requires HIGH comparisons with every cluster member. Uncalibrated automatic merging is disabled by default.
+
+SQLite migrations preserve the existing JSON-payload index. Reviewed track relations survive person edits and reanalysis. Reanalysis samples prior reviewed timestamps, and unresolved correspondence to reviewed history blocks automatic merging. Regrouping uses cached embeddings; embedding recalculation uses checksummed aligned crops.
+
+Useful verification command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q --basetemp=.test-artifacts/pytest
+```
+
+The optional genuine-model integration test needs locally downloaded models and an official sample image at `videoatlas/resources/model-smoke.jpg`; it skips when they are absent. Synthetic fixtures test application behavior. They are not an accuracy benchmark.

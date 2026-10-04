@@ -1,0 +1,5 @@
+# Optional local checkpoint export; the application itself uses ONNX Runtime.
+numpy==1.26.4
+torch==2.14.1
+onnx==1.17.0
+gdown==6.4.1

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import ctypes
 import hashlib
 import json
@@ -9,12 +9,14 @@ import os
 from pathlib import Path
 import sys
 import threading
+import logging
 from typing import Callable, Iterator
 
 import cv2
 import numpy as np
 
 from .recognition import RecognitionOptions, default_config_path
+from .model_adapters import SCRFDDetector, AdaFaceAdapter, align_crop, face01_tensor, FACE01_PREPROCESSING, ADAFACE_PREPROCESSING, configure_windows_nvidia_libraries, landmark_visibility_proxy, preprocessing_identity, upper_visible_mask, FACE01_TEMPLATE
 
 
 @dataclass
@@ -26,6 +28,12 @@ class FaceSample:
     embedding_model: str | None = None
     quality: float = 1.0
     rejection_reason: str | None = None
+    frame_number: int | None = None
+    detection_score: float | None = None
+    landmarks: list | None = None
+    pose: dict[str, float] | None = None
+    aligned_path: str | None = None
+    embeddings: dict[str, list[float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -51,9 +59,8 @@ class _SessionState:
 _SESSION_CACHE: OrderedDict[tuple[object, ...], _SessionState] = OrderedDict()
 _SESSION_CACHE_LOCK = threading.RLock()
 _DLL_DIGEST_CACHE: OrderedDict[tuple[object, ...], str] = OrderedDict()
-_FACE01_PREPROCESSING = "face01-rgb224-nchw-imagenet-align5-v3"
+_FACE01_PREPROCESSING = FACE01_PREPROCESSING
 _FACE01_MODEL_SHA256 = "e7ca51f4bc85f73ddb830683ac6a09077909fa45a52b2bff41a9c6e8ff267e2f"
-_LANDMARK_MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
 _EMBEDDING_SIZE = 512
 _CUDA_ARENA_BYTES = 2 * 1024 ** 3
 _TRT_WORKSPACE_BYTES = 1024 ** 3
@@ -142,6 +149,15 @@ def _gpu_identity(device_id: int) -> tuple[object, ...] | None:
 
 class VideoAnalyzer:
     _CHUNK_SIZE = 60
+    _FACE_ACTIVITY_WINDOW = 1.5
+
+    @property
+    def face01_preprocessing(self):
+        return preprocessing_identity('face01', self.options.recognition_region)
+
+    @property
+    def adaface_preprocessing(self):
+        return preprocessing_identity('adaface', self.options.recognition_region)
 
     def __init__(self, options: RecognitionOptions | None = None) -> None:
         if sys.platform != "win32":
@@ -150,7 +166,8 @@ class VideoAnalyzer:
         self.options = options or RecognitionOptions.load(config_path if config_path.is_file() else None)
         self.options.validate()
         self._closed = False
-        self._landmarker = None
+        self._detector = None
+        self._adaface = None
         self._session = None
         self._state = None
         self._dll_directory_handle = None
@@ -166,11 +183,6 @@ class VideoAnalyzer:
             default_model = Path(__file__).parent / "resources" / "JAPANESE_FACE_V1.onnx"
             if self.model_path == default_model.resolve() and self.model_sha256 != _FACE01_MODEL_SHA256:
                 raise RuntimeError(f"FACE01 model checksum mismatch: {self.model_path}")
-            task_path = Path(__file__).parent / "resources" / "face_landmarker.task"
-            if not task_path.is_file():
-                raise FileNotFoundError(f"MediaPipe FaceLandmarker model is missing: {task_path}")
-            if _sha256_file(task_path) != _LANDMARK_MODEL_SHA256:
-                raise RuntimeError(f"MediaPipe FaceLandmarker model checksum mismatch: {task_path}")
             if self.options.tensorrt_dll_dir is not None:
                 dll_dir = self.options.tensorrt_dll_dir.expanduser().resolve()
                 if not dll_dir.is_dir():
@@ -181,23 +193,13 @@ class VideoAnalyzer:
             self._input = self._state.model_input
             self._output = self._state.model_output
             self._dynamic_batch = self._state.dynamic_batch
-            self.embedding_model = f"face01:{self.model_sha256}:{_FACE01_PREPROCESSING}:{self._state.profile}"
+            self.embedding_model = f"face01:{self.model_sha256}:{self.face01_preprocessing}:{self._state.profile}"
             self.runtime_description = report
-            cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-            self._detector = cv2.CascadeClassifier(str(cascade_path))
-            if self._detector.empty():
-                raise RuntimeError(f"OpenCV face detector could not be loaded: {cascade_path}")
-            try:
-                import mediapipe as mp
-            except ImportError as error:
-                raise RuntimeError("Python package 'mediapipe' is required for face landmarks") from error
-            task_options = mp.tasks.vision.FaceLandmarkerOptions(
-                base_options=mp.tasks.BaseOptions(model_asset_path=str(task_path)),
-                running_mode=mp.tasks.vision.RunningMode.IMAGE,
-                num_faces=20,
-            )
-            self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(task_options)
-            self._mp = mp
+            self._detector = SCRFDDetector(self.options)
+            self._adaface = AdaFaceAdapter(self.options.adaface_model_path, self.options) if self.options.adaface_enabled else None
+            self.runtime_description += f"; SCRFD {self._detector.sha256[:12]}; AdaFace: {'enabled' if self._adaface else 'disabled'}"
+            if self._detector.multiscale:
+                self.runtime_description += f"; upper multi-scale detector {self._detector.inference_sha256[:12]}"
         except BaseException:
             try:
                 self.close()
@@ -236,6 +238,7 @@ class VideoAnalyzer:
         balanced = self.options.precision == "balanced"
         preferred = ["CPUExecutionProvider"]
         if requested != "cpu":
+            configure_windows_nvidia_libraries()
             preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             if balanced and requested in {"auto", "tensorrt"}:
                 preferred.insert(0, "TensorrtExecutionProvider")
@@ -371,7 +374,7 @@ class VideoAnalyzer:
         dll_names = [Path(path).name.lower() for path, _ in gpu_identity[3]]
         if not all(any(name.startswith(prefix) for name in dll_names) for prefix in ("nvinfer_", "nvinfer_plugin_", "nvonnxparser_")):
             return None
-        identity = (self.model_sha256, _FACE01_PREPROCESSING, runtime_identity, gpu_identity, tuple(sorted(trt_options.items())), tuple(sorted(cuda_options.items())))
+        identity = (self.model_sha256, self.face01_preprocessing, runtime_identity, gpu_identity, tuple(sorted(trt_options.items())), tuple(sorted(cuda_options.items())))
         key = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
         try:
             root = (self.options.cache_dir or default_config_path().parent / "InferenceCache").expanduser().resolve()
@@ -409,13 +412,61 @@ class VideoAnalyzer:
             raise RuntimeError("OpenCV could not encode a JPEG image")
         return encoded.tobytes()
 
-    def iter_chunks(self, video_path: Path, interval: float, start: float = 0, end: float | None = None, stop: Callable[[], bool] | None = None, progress: Callable[[float, float], None] | None = None) -> Iterator[AnalysisChunk]:
+    @staticmethod
+    def _sample_times(interval: float, start: float, end: float, forced_times: list[float]) -> Iterator[float]:
+        """Merge exact review anchors with a zero-based sampling grid lazily.
+
+        Timestamp duplicates are removed. Distinct anchor timestamps are retained
+        even if a low-FPS decoder maps them to the same native frame.
+        """
+        anchors = iter(sorted({value for value in forced_times if start <= value < end}))
+        anchor = next(anchors, None)
+        index = max(0, int(np.ceil(start / interval - 1e-10)))
+        regular = index * interval
+        if regular < start:
+            regular = start
+        previous = None
+        while regular < end or anchor is not None:
+            coincides = anchor is not None and abs(anchor-regular) <= 1e-9
+            if anchor is not None and (regular >= end or anchor <= regular or coincides):
+                requested = anchor
+                anchor = next(anchors, None)
+                if coincides:
+                    index += 1
+                    regular = index * interval
+            else:
+                requested = regular
+                index += 1
+                regular = index * interval
+                if not np.isfinite(regular) or regular <= requested:
+                    raise ValueError("Sampling interval cannot advance the video position")
+            if requested != previous:
+                yield requested
+                previous = requested
+
+    def iter_chunks(self, video_path: Path, interval: float, start: float = 0, end: float | None = None, stop: Callable[[], bool] | None = None, progress: Callable[[float, float], None] | None = None, forced_times: list[float] | None = None) -> Iterator[AnalysisChunk]:
+        """Sample the regular grid and review anchors, with bounded face activity.
+
+        A detected face keeps dense sampling active for 1.5 seconds. Dense events
+        never replace regular grid events or exact review anchors. A nonzero
+        resume processes its exact cursor first and conservatively enables the
+        same 1.5-second window because previous detection state may be unavailable.
+        Forced timestamps alone are never treated as positive detections.
+        """
         if not np.isfinite(interval) or interval <= 0:
             raise ValueError("interval must be a finite number greater than zero")
         if not np.isfinite(start) or start < 0:
             raise ValueError("start must be a finite number greater than or equal to zero")
         if end is not None and (not np.isfinite(end) or end < 0):
             raise ValueError("end must be a finite number greater than or equal to zero")
+        anchors = []
+        if forced_times is not None:
+            if not isinstance(forced_times, list):
+                raise ValueError("forced_times must be a list of finite nonnegative timestamps")
+            for value in forced_times:
+                if isinstance(value, bool) or not isinstance(value, (int,float)) or not np.isfinite(value) or value < 0:
+                    raise ValueError("forced_times must contain finite nonnegative timestamps")
+                anchors.append(float(value))
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("Analyzer is closed")
@@ -435,7 +486,12 @@ class VideoAnalyzer:
             if end is not None and end <= start and start < duration:
                 raise ValueError("end must be greater than start")
             final_second = min(duration, duration if end is None else float(end))
-            requested = min(float(start), duration)
+            timeline = self._sample_times(interval,min(float(start),duration),final_second,anchors)
+            scheduled = next(timeline,final_second)
+            requested = min(float(start),scheduled) if start > 0 else scheduled
+            dense_interval = min(interval,self.options.face_sample_interval)
+            adaptive_enabled = dense_interval < interval
+            active_until = requested+self._FACE_ACTIVITY_WINDOW if start > 0 and adaptive_enabled else -float('inf')
             faces: list[FaceSample] = []
             chunk_frames = 0
             poster: bytes | None = None
@@ -481,14 +537,27 @@ class VideoAnalyzer:
                 if frame_faces is None or self._stopped(stop):
                     cancelled = True
                     break
+                for sample in frame_faces:
+                    sample.frame_number = target_index
                 faces.extend(frame_faces)
+                if frame_faces:
+                    active_until = requested+self._FACE_ACTIVITY_WINDOW
                 if poster is None:
                     poster = frame_poster
                 chunk_frames += 1
-                next_second = requested + interval
-                if not np.isfinite(next_second) or next_second <= requested:
+                # Keep the pending regular/anchor event buffered when inserting
+                # a dense event, so chunk yields and cancellation cannot lose it.
+                if abs(requested-scheduled) <= 1e-9:
+                    scheduled = next(timeline,final_second)
+                dense_next = requested+dense_interval
+                if not np.isfinite(dense_next) or dense_next <= requested:
                     raise ValueError("Sampling interval cannot advance the video position")
-                completed = min(next_second, final_second)
+                if not adaptive_enabled or dense_next > active_until+1e-9:
+                    dense_next = final_second
+                if abs(dense_next-scheduled) <= 1e-9:
+                    completed = min(scheduled,final_second)
+                else:
+                    completed = min(scheduled,dense_next,final_second)
                 if progress is not None:
                     progress(completed, duration)
                 requested = completed
@@ -509,115 +578,172 @@ class VideoAnalyzer:
         if self._stopped(stop):
             return None, None
         frame_h, frame_w = original_frame.shape[:2]
-        detect_frame = original_frame
-        max_dimension = self.options.detection_max_dimension
-        if max(frame_h, frame_w) > max_dimension:
-            scale = max_dimension / max(frame_h, frame_w)
-            detect_frame = cv2.resize(original_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB)
-        result = self._landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb))
-        candidates: list[tuple[tuple[int, int, int, int], object | None]] = []
-        if result.face_landmarks:
-            for landmarks in result.face_landmarks:
-                if not landmarks or any(not np.isfinite(point.x) or not np.isfinite(point.y) for point in landmarks):
-                    continue
-                x0 = int(np.clip(np.floor(min(point.x for point in landmarks) * frame_w), 0, frame_w))
-                y0 = int(np.clip(np.floor(min(point.y for point in landmarks) * frame_h), 0, frame_h))
-                x1 = int(np.clip(np.ceil(max(point.x for point in landmarks) * frame_w), 0, frame_w))
-                y1 = int(np.clip(np.ceil(max(point.y for point in landmarks) * frame_h), 0, frame_h))
-                candidates.append(((x0, y0, x1, y1), landmarks))
-        else:
-            gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
-            boxes = self._detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
-            scale_x, scale_y = frame_w / detect_frame.shape[1], frame_h / detect_frame.shape[0]
-            for x, y, width, height in boxes:
-                box = (max(0, int(x * scale_x)), max(0, int(y * scale_y)), min(frame_w, int((x + width) * scale_x)), min(frame_h, int((y + height) * scale_y)))
-                candidates.append((box, None))
-        prepared = []
-        for box, landmarks in candidates:
+        samples = []
+        for detection in self._detector.detect(original_frame):
             if self._stopped(stop):
                 return None, None
+            box, points = detection.box, detection.landmarks
             x0, y0, x1, y1 = box
             if x1 <= x0 or y1 <= y0:
                 continue
-            thumb = self._encode_jpeg(original_frame[y0:y1, x0:x1], 80)
-            if landmarks is None:
-                prepared.append((box, thumb, None, 0.0, "haar_fallback_unclassified"))
-            else:
-                aligned, quality, reason = self._align_and_quality(original_frame, landmarks, box)
-                prepared.append((box, thumb, aligned, quality, reason))
-        tensors = [item[2] for item in prepared if item[2] is not None]
-        try:
-            embeddings = self._infer_batch(tensors, stop)
-        except Exception as error:
-            raise RuntimeError(f"FACE01 inference failed with registered providers {', '.join(self._state.providers)}; automatic runtime provider changes are disabled. Select CPU or another acceleration setting to reanalyze. {error}") from error
-        if embeddings is None or self._stopped(stop):
-            return None, None
-        frame_faces = []
-        embedding_index = 0
-        for box, thumb, aligned, quality, reason in prepared:
-            embedding = None
-            if aligned is not None:
-                embedding = embeddings[embedding_index]
-                embedding_index += 1
-            x0, y0, x1, y1 = box
-            frame_faces.append(FaceSample(second, (x0 / frame_w, y0 / frame_h, (x1 - x0) / frame_w, (y1 - y0) / frame_h), thumb, embedding, self.embedding_model if embedding is not None else None, quality, reason))
-        return frame_faces, self._encode_jpeg(detect_frame, 75) if include_poster else None
+            thumbnail = self._encode_jpeg(original_frame[y0:y1, x0:x1], 80)
+            crop, auxiliary, quality, reason, pose = self._prepare_face(original_frame, points, box, detection.score)
+            sample = FaceSample(second, (x0/frame_w, y0/frame_h, (x1-x0)/frame_w, (y1-y0)/frame_h), thumbnail, None, None, quality, reason,
+                                detection_score=detection.score, landmarks=points.tolist(), pose=pose)
+            if crop is not None:
+                sample.aligned_path = self._cache_crops(crop, auxiliary)
+                values = self._infer_batch([face01_tensor(crop)], stop)
+                if values is None:
+                    return None, None
+                sample.embedding, sample.embedding_model = values[0], self.embedding_model
+                sample.embeddings[self.embedding_model] = values[0]
+                if self._adaface is not None:
+                    sample.embeddings[self._adaface.model_key] = self._adaface.embed(auxiliary)
+            samples.append(sample)
+        return samples, self._encode_jpeg(original_frame, 75) if include_poster else None
 
-    def _align_and_quality(self, frame: np.ndarray, landmarks: list, box: tuple[int, int, int, int]) -> tuple[np.ndarray | None, float, str | None]:
+    def _prepare_face(self, frame, points, box, detection_score):
         x0, y0, x1, y1 = box
-        width, height = x1 - x0, y1 - y0
-        if min(width, height) < self.options.min_face_size:
-            return None, 0.0, "face_too_small"
+        width, height = x1-x0, y1-y0
+        def reject(reason, pose=None):
+            return None, None, 0.0, reason, pose
+        if min(width,height) < self.options.min_face_size:
+            return reject('face_too_small')
+        points = np.asarray(points, np.float32)
+        upper = self.options.recognition_region == 'upper'
+        if points.shape != (5,2) or not np.isfinite(points[:2] if upper else points).all():
+            return reject('landmarks_invalid')
+        eyes = points[1]-points[0]
+        eye_gap = float(np.linalg.norm(eyes))
+        if eye_gap < max(12,width*.12) or points[1,0] <= points[0,0]:
+            return reject('eye_distance_invalid')
+        eye_mid = (points[0]+points[1])*.5
+        # Project onto the eye axis so roll is not mistaken for yaw.
+        yaw = 0.0 if upper else float(np.dot(points[2]-eye_mid, eyes/eye_gap))/eye_gap
+        # A geometric yaw proxy in approximate degrees, not a calibrated 3D
+        # head-pose measurement. Preserve its dimensionless ratio explicitly.
+        pose = {'yaw':None if upper else float(np.degrees(np.arctan(2*yaw))), 'yaw_ratio':None if upper else yaw,
+                'roll':float(np.degrees(np.arctan2(eyes[1],eyes[0]))), 'recognition_region':self.options.recognition_region}
+        if not upper and abs(yaw) > self.options.pose_threshold:
+            return reject('pose_yaw_out_of_range',pose)
+        down = np.asarray([-eyes[1], eyes[0]]) / eye_gap
+        if not upper and (np.dot(points[2]-eye_mid, down) <= 0 or min(np.dot(points[3]-points[2], down), np.dot(points[4]-points[2], down)) <= 0 or np.dot(points[4]-points[3], eyes/eye_gap) <= 0):
+            return reject('landmark_geometry_invalid',pose)
         try:
-            source = np.asarray([[landmarks[index].x * frame.shape[1], landmarks[index].y * frame.shape[0]] for index in (263, 362, 33, 133, 2)], dtype=np.float32)
-        except (IndexError, AttributeError, TypeError):
-            return None, 0.0, "landmarks_missing"
-        if source.shape != (5, 2) or not np.isfinite(source).all():
-            return None, 0.0, "landmarks_non_finite"
-        eye_gap = float(np.linalg.norm(source[0] - source[2]))
-        if eye_gap < max(12.0, width * 0.12):
-            return None, 0.0, "eye_distance_invalid"
-        eye_midpoint = (source[0] + source[2]) * 0.5
-        yaw_ratio = abs(float(source[4, 0] - eye_midpoint[0])) / max(eye_gap, 1.0)
-        if yaw_ratio > 0.48:
-            return None, 0.0, "pose_yaw_out_of_range"
-        raw_template = np.asarray([[0.8595674595992, 0.2134981538014], [0.6460604764104, 0.2289674387677], [0.1205750620789, 0.2137274526848], [0.3340850613712, 0.2290642403242], [0.4901123135679, 0.6277975316475]], dtype=np.float32)
-        destination = (raw_template + 0.1) / 1.2 * 224.0
-        transform, _ = cv2.estimateAffinePartial2D(source, destination, method=cv2.LMEDS)
-        if transform is None or not np.isfinite(transform).all() or np.linalg.det(transform[:, :2]) <= 0:
-            return None, 0.0, "alignment_failed"
-        residual_points = cv2.transform(source[None, :, :], transform)[0]
-        residual = float(np.sqrt(np.mean(np.sum((residual_points - destination) ** 2, axis=1))))
-        if not np.isfinite(residual) or residual > 24.0:
-            return None, 0.0, "alignment_residual_high"
-        aligned_bgr = cv2.warpAffine(frame, transform, (224, 224), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(127, 127, 127))
-        corners = np.asarray([[[0, 0], [223, 0], [223, 223], [0, 223]]], dtype=np.float32)
-        frame_corners = cv2.transform(corners, cv2.invertAffineTransform(transform))[0]
-        if np.any(frame_corners < 0) or np.any(frame_corners[:, 0] >= frame.shape[1]) or np.any(frame_corners[:, 1] >= frame.shape[0]):
-            support = cv2.warpAffine(np.ones(frame.shape[:2], dtype=np.uint8), transform, (224, 224), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            if float(np.mean(support)) < 0.85:
-                return None, 0.0, "alignment_outside_frame"
-        gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        brightness = float(np.mean(gray))
-        saturation = float(np.mean(cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)[:, :, 1]))
-        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            crop, residual, support = align_crop(frame,points,'face01',self.options.recognition_region)
+            auxiliary, residual_aux, support_aux = align_crop(frame,points,'adaface',self.options.recognition_region)
+        except ValueError:
+            return reject('alignment_failed',pose)
+        if max(residual,residual_aux) > .08:
+            return reject('alignment_residual_high',pose)
+        if min(support,support_aux) < .70:
+            return reject('alignment_outside_frame',pose)
+        if upper:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            visible = upper_visible_mask(crop.shape, FACE01_TEMPLATE[:2]).astype(np.uint8)
+            # Erode to keep the synthetic mask edge out of sharpness estimates.
+            interior = cv2.erode(visible, np.ones((5,5),np.uint8)).astype(bool)
+            pixels = gray[interior]
+            brightness, contrast = float(pixels.mean()), float(pixels.std())
+            blur = float(cv2.Laplacian(gray,cv2.CV_64F)[interior].var())
+        else:
+            gray = cv2.cvtColor(frame[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY)
+            brightness, contrast = float(gray.mean()),float(gray.std())
+            blur = float(cv2.Laplacian(gray,cv2.CV_64F).var())
         if brightness < 18 or brightness > 242:
-            return None, 0.0, "brightness_out_of_range"
-        if saturation > 250:
-            return None, 0.0, "saturation_out_of_range"
-        if blur < 12.0:
-            return None, 0.0, "blur_too_high"
-        blur_score = min(1.0, blur / 180.0)
-        light_score = max(0.0, 1.0 - abs(brightness - 128.0) / 150.0)
-        pose_score = max(0.0, 1.0 - yaw_ratio / 0.6)
-        align_score = max(0.0, 1.0 - residual / 32.0)
-        quality = float(np.clip(0.30 * blur_score + 0.20 * light_score + 0.25 * pose_score + 0.25 * align_score, 0.0, 1.0))
-        rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
-        chw = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
-        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
-        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
-        return ((chw - mean) / std).astype(np.float32), quality, None
+            return reject('brightness_out_of_range',pose)
+        if contrast < 8:
+            return reject('contrast_too_low',pose)
+        if blur < self.options.blur_threshold:
+            return reject('blur_too_high',pose)
+        if upper:
+            visible_source = upper_visible_mask(frame.shape, points[:2])
+            visibility_frame = np.where(visible_source[...,None], frame, 128).astype(np.uint8)
+            visibility = landmark_visibility_proxy(visibility_frame, points[:2])
+        else:
+            visibility = landmark_visibility_proxy(frame, points)
+        pose['visibility_proxy'] = visibility
+        # Local patch visibility is a heuristic occlusion input, not a calibrated classifier.
+        scores = [min(1,blur/180),max(0,1-abs(brightness-128)/150),min(1,contrast/45),
+                  max(0,1-abs(yaw)/self.options.pose_threshold),max(0,1-max(residual,residual_aux)/.12),
+                  float(detection_score),min(1,min(width,height)/(self.options.min_face_size*2)),visibility,min(support,support_aux)]
+        quality = float(np.clip(np.mean(scores),0,1))
+        if quality < self.options.min_quality:
+            return None,None,quality,'quality_below_threshold',pose
+        return crop,auxiliary,quality,None,pose
+
+    def _align_and_quality(self, frame, landmarks, box):
+        crop,_,quality,reason,_ = self._prepare_face(frame,landmarks,box,1.0)
+        return face01_tensor(crop) if crop is not None else None,quality,reason
+
+    def _cache_crops(self, crop, auxiliary):
+        root = (self.options.cache_dir or default_config_path().parent/'InferenceCache')/'AlignedFaces'
+        identity = hashlib.sha256(crop.tobytes()+auxiliary.tobytes()+self.face01_preprocessing.encode()).hexdigest()
+        root.mkdir(parents=True,exist_ok=True)
+        path = root/f'{identity}.png'
+        for destination,image in ((path,crop),(path.with_suffix('.adaface.png'),auxiliary)):
+            if destination.exists():
+                continue
+            ok,encoded = cv2.imencode('.png',image)
+            if not ok:
+                raise RuntimeError('Cannot encode aligned face cache')
+            temporary = destination.with_suffix(f'.{threading.get_ident()}.tmp')
+            temporary.write_bytes(encoded.tobytes())
+            temporary.replace(destination)
+        path.with_suffix('.json').write_text(json.dumps({'face01_preprocessing':self.face01_preprocessing,'adaface_preprocessing':self.adaface_preprocessing,
+                                                        'face01_sha256':_sha256_file(path),'adaface_sha256':_sha256_file(path.with_suffix('.adaface.png'))}),encoding='utf-8')
+        return str(path)
+
+    def recalculate_samples(self, samples: list[FaceSample], stop=None, progress=None) -> list[FaceSample]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError('Analyzer is closed')
+            if self._active:
+                raise RuntimeError('Analyzer is already processing')
+            self._active = True
+        try:
+            return self._recalculate_samples(samples,stop,progress)
+        finally:
+            with self._lifecycle_lock:
+                self._active = False
+                if self._closed:
+                    self._release_resources()
+
+    def _recalculate_samples(self, samples: list[FaceSample], stop=None, progress=None) -> list[FaceSample]:
+        """Regenerate embeddings from cached lossless crops without reading the video.
+
+        Returns fresh samples and drops old model embeddings to prevent mixing versions.
+        Missing caches fail explicitly. Storage commits the result transactionally.
+        """
+        updated = []
+        for index,sample in enumerate(samples):
+            if self._stopped(stop):
+                break
+            if sample.aligned_path is None or sample.rejection_reason is not None:
+                updated.append(replace(sample,embedding=None,embedding_model=None,embeddings={}))
+                continue
+            path = Path(sample.aligned_path)
+            metadata = json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
+            if metadata.get('face01_preprocessing') != self.face01_preprocessing or metadata.get('face01_sha256') != _sha256_file(path):
+                raise ValueError(f'Aligned face cache preprocessing or checksum mismatch: {path}')
+            crop = cv2.imread(str(path))
+            if crop is None:
+                raise FileNotFoundError(f'Aligned face cache is missing: {path}')
+            values = self._infer_batch([face01_tensor(crop)],stop)
+            if values is None:
+                break
+            embeddings = {self.embedding_model:values[0]}
+            if self._adaface is not None:
+                if metadata.get('adaface_preprocessing') != self.adaface_preprocessing or metadata.get('adaface_sha256') != _sha256_file(path.with_suffix('.adaface.png')):
+                    raise ValueError(f'AdaFace aligned cache preprocessing or checksum mismatch: {path}')
+                auxiliary = cv2.imread(str(path.with_suffix('.adaface.png')))
+                if auxiliary is None:
+                    raise FileNotFoundError(f'AdaFace aligned cache is missing: {path}')
+                embeddings[self._adaface.model_key] = self._adaface.embed(auxiliary)
+            updated.append(replace(sample,embedding=values[0],embedding_model=self.embedding_model,embeddings=embeddings))
+            if progress is not None:
+                progress(index+1,len(samples))
+        return updated
 
     def _infer_batch(self, tensors: list[np.ndarray], stop: Callable[[], bool] | None = None) -> list[list[float]] | None:
         rows = []
@@ -631,27 +757,52 @@ class VideoAnalyzer:
             with self._state.lock:
                 if self._stopped(stop):
                     return None
-                if any(provider in self._state.providers for provider in ("CUDAExecutionProvider", "TensorrtExecutionProvider")):
-                    values = self._gpu_buffers.get(len(batch))
-                    if values is None:
-                        input_value = self._ort.OrtValue.ortvalue_from_shape_and_type(list(batch.shape), np.float32, "cuda", self.options.gpu_device_id)
-                        output_value = self._ort.OrtValue.ortvalue_from_shape_and_type([len(batch), _EMBEDDING_SIZE], np.float32, "cuda", self.options.gpu_device_id)
-                        binding = self._session.io_binding()
-                        binding.bind_ortvalue_input(self._input.name, input_value)
-                        binding.bind_ortvalue_output(self._output.name, output_value)
-                        values = (input_value, output_value, binding)
-                        self._gpu_buffers[len(batch)] = values
-                        while len(self._gpu_buffers) > 2:
-                            self._gpu_buffers.popitem(last=False)
-                    self._gpu_buffers.move_to_end(len(batch))
-                    input_value, output_value, binding = values
-                    input_value.update_inplace(batch)
-                    binding.synchronize_inputs()
-                    self._session.run_with_iobinding(binding)
-                    binding.synchronize_outputs()
-                    output = output_value.numpy()
-                else:
-                    output = self._session.run([self._output.name], {self._input.name: batch})[0]
+                try:
+                    if any(provider in self._state.providers for provider in ("CUDAExecutionProvider", "TensorrtExecutionProvider")):
+                        values = self._gpu_buffers.get(len(batch))
+                        if values is None:
+                            input_value = self._ort.OrtValue.ortvalue_from_shape_and_type(list(batch.shape), np.float32, "cuda", self.options.gpu_device_id)
+                            output_value = self._ort.OrtValue.ortvalue_from_shape_and_type([len(batch), _EMBEDDING_SIZE], np.float32, "cuda", self.options.gpu_device_id)
+                            binding = self._session.io_binding()
+                            binding.bind_ortvalue_input(self._input.name, input_value)
+                            binding.bind_ortvalue_output(self._output.name, output_value)
+                            values = (input_value, output_value, binding)
+                            self._gpu_buffers[len(batch)] = values
+                            while len(self._gpu_buffers) > 2:
+                                self._gpu_buffers.popitem(last=False)
+                        self._gpu_buffers.move_to_end(len(batch))
+                        input_value, output_value, binding = values
+                        input_value.update_inplace(batch)
+                        binding.synchronize_inputs()
+                        self._session.run_with_iobinding(binding)
+                        binding.synchronize_outputs()
+                        output = output_value.numpy()
+                    else:
+                        output = self._session.run([self._output.name], {self._input.name: batch})[0]
+                except Exception:
+                    if self._state.providers == ('CPUExecutionProvider',):
+                        raise
+                    logging.getLogger(__name__).exception('FACE01 GPU execution failed; retrying on CPU')
+                    failed_state = self._state
+                    with _SESSION_CACHE_LOCK:
+                        for key,entry in list(_SESSION_CACHE.items()):
+                            if entry is failed_state:
+                                del _SESSION_CACHE[key]
+                    config = self._ort.SessionOptions()
+                    config.intra_op_num_threads = self.options.threads
+                    config.inter_op_num_threads = 1
+                    cpu = self._ort.InferenceSession(str(self.model_path), sess_options=config, providers=['CPUExecutionProvider'])
+                    model_input, model_output, dynamic = self._validate_model(cpu)
+                    cpu.disable_fallback()
+                    profile = f'cpu-fp32-ort{self._ort.__version__}-runtime-fallback'
+                    self._state = _SessionState(cpu,model_input,model_output,dynamic,('CPUExecutionProvider',),profile,threading.Lock())
+                    self._session,self._input,self._output,self._dynamic_batch = cpu,model_input,model_output,dynamic
+                    self._gpu_buffers.clear()
+                    self.embedding_model = f'face01:{self.model_sha256}:{self.face01_preprocessing}:{profile}'
+                    self.runtime_description += '; FACE01 execution failure: switched to CPU'
+                    # Drop any GPU rows already produced in this call so one returned
+                    # batch never carries mixed numerical profiles under one key.
+                    return self._infer_batch(tensors,stop)
             vectors = np.asarray(output, dtype=np.float32)
             if vectors.shape != (len(batch), _EMBEDDING_SIZE) or not np.isfinite(vectors).all():
                 raise RuntimeError(f"FACE01 produced invalid embeddings: {vectors.shape}")
@@ -668,15 +819,12 @@ class VideoAnalyzer:
                 self._release_resources()
 
     def _release_resources(self) -> None:
-        try:
-            if self._landmarker is not None:
-                self._landmarker.close()
-        finally:
-            self._landmarker = None
-            self._gpu_buffers.clear()
-            self._session = None
-            self._state = None
-            self._dll_libraries.clear()
-            if self._dll_directory_handle is not None:
-                self._dll_directory_handle.close()
-                self._dll_directory_handle = None
+        self._detector = None
+        self._adaface = None
+        self._gpu_buffers.clear()
+        self._session = None
+        self._state = None
+        self._dll_libraries.clear()
+        if self._dll_directory_handle is not None:
+            self._dll_directory_handle.close()
+            self._dll_directory_handle = None

@@ -6,7 +6,7 @@ if not exist "%APP_ROOT%\.venv\Scripts\python.exe" (
 )
 pushd "%APP_ROOT%"
 if errorlevel 1 exit /b 1
-".venv\Scripts\python.exe" -m videoatlas
+".venv\Scripts\python.exe" -m videoatlas %*
 set "APP_EXIT=%ERRORLEVEL%"
 popd
 exit /b %APP_EXIT%

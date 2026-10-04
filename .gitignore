@@ -1,4 +1,12 @@
 .venv/
+.test-deps/
+.test-artifacts/
+.model-smoke-cache/
+.model-test-tmp*/
+.model-test-anchor-tmp*/
+.model-test-adaptive-tmp*/
+.gpu-test-deps/
+/videoatlas/resources/
 venv/
 __pycache__/
 *.py[cod]
@@ -18,6 +26,9 @@ Desktop.ini
 *.mp4
 *.mov
 *.m4v
+*.avi
+*.mkv
+*.webm
 *.sqlite
 *.sqlite3
 *.db
@@ -26,7 +37,14 @@ Thumbnails/
 videoatlas/resources/face_landmarker.task
 videoatlas/resources/JAPANESE_FACE_*.onnx
 videoatlas/resources/FACE01-LICENSE.txt
+videoatlas/resources/*.onnx
+videoatlas/resources/*.ckpt
+videoatlas/resources/*-LICENSE.txt
+Aligned/
 InferenceCache/
 *.engine
 *.profile
 *.timing
+
+# User-only original design document (public specification is in English).
+/docs/private/design-specification.ja.md

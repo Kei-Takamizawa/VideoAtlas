@@ -2,18 +2,19 @@
 
 [English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh.md) | [हिन्दी](README.hi.md) | [Español](README.es.md) | [العربية](README.ar.md) | [Français](README.fr.md) | **Bahasa Indonesia** | [한국어](README.ko.md) | [Русский](README.ru.md) | [Português](README.pt.md)
 
-**Perpustakaan video lokal khusus Windows.** Jelajahi dan putar video, lalu temukan adegan berdasarkan orang yang muncul. Saran pencocokan wajah dapat Anda periksa dan koreksi di aplikasi.
+VideoAtlas adalah aplikasi lokal untuk Windows yang mengatur video dan membantu mencari adegan berdasarkan orang yang muncul. Format yang didukung: MP4, MOV, AVI, MKV, M4V, dan WebM. Video dikenali dari hash kontennya, sehingga mengganti nama file saja tidak memicu analisis ulang.
 
 ## Yang dapat dilakukan
 
-- Menjelajahi dan memutar video di folder pilihan
-- Mencari kandidat orang, video terkait, dan waktu kemunculan wajah
-- Menjeda dan melanjutkan analisis, serta menetapkan, memisahkan, menggabungkan, atau mengecualikan hasil wajah secara manual
-- Menyimpan indeks di PC tanpa memindahkan video asli
+- Mengumpulkan beberapa sampel wajah per video dan melacak orang di dalamnya
+- Mencocokkan orang di video berbeda dengan hati-hati
+- Meninjau saran lalu memilih “orang yang sama”, “orang berbeda”, atau “nanti” (tombol S, D, L)
+- Mengubah nama, menggabungkan atau memisahkan grup, mengecualikan orang, dan memilih gambar perwakilan
+- Menyimpan pasangan yang ditinjau untuk mengevaluasi hasil pencocokan
 
-Pengelompokan otomatis adalah saran berdasarkan kemiripan visual dan dapat keliru. Periksa dan koreksi hasilnya. Akurasi pencocokan wajah belum diukur. Pemrosesan berlangsung lokal; penyiapan pertama mengunduh perangkat lunak dan model yang diperlukan.
+Penggabungan otomatis lintas video nonaktif secara default. Koleksi video nyata kecil sudah dievaluasi, tetapi ambang saat ini melewatkan banyak kecocokan. Akurasi dengan masker asli belum diverifikasi. Nama berkas tidak digunakan untuk mengenali orang. Lihat hasil dan batas mode wajah atas pada [status implementasi](docs/IMPLEMENTATION_STATUS.md).
 
-## Penyiapan Windows
+## Memulai di Windows
 
 Perlu Windows 64-bit, Python 3.12, dan PowerShell. Jalankan dari folder proyek:
 
@@ -22,12 +23,4 @@ Perlu Windows 64-bit, Python 3.12, dan PowerShell. Jalankan dari folder proyek:
 .\Scripts\run_windows.cmd
 ```
 
-Penyiapan standar menggunakan CPU. Untuk akselerasi NVIDIA CUDA, jalankan `.\Scripts\setup_windows.cmd -Gpu`. TensorRT harus dipasang terpisah; lihat [petunjuk penyiapan Windows](docs/WINDOWS_SETUP.md). Implementasi Windows belum diuji saat dijalankan: tidak ada tes, peluncuran aplikasi, atau analisis video nyata.
-
-## Privasi dan model
-
-Indeks dan gambar yang dibuat disimpan di data aplikasi lokal Windows. Aplikasi tidak mengunggah video atau data wajah. Penyiapan mengunduh model FACE01 wajah Jepang dan MediaPipe Face Landmarker yang versinya sudah ditetapkan, lalu memeriksa SHA-256. Model FACE01 memiliki ketentuan tersendiri; bacalah sebelum digunakan. [Lisensi MIT](LICENSE) proyek tidak mencakup model atau dependensi pihak ketiga.
-
-## Status proyek
-
-Implementasi Windows belum diuji saat dijalankan: tidak ada tes, peluncuran aplikasi, atau analisis video nyata. Rilis khusus Windows ini tidak mendukung aplikasi dan penyiapan macOS sebelumnya.
+Pengaturan standar memakai CPU dan mengunduh model resmi dengan verifikasi checksum. Antarmuka tersedia dalam bahasa Inggris dan Jepang. Baca [panduan penyiapan Windows](docs/WINDOWS_SETUP.md). Video asli tetap di tempatnya dan indeks tersimpan di PC. Aplikasi tidak mengunggah video atau data wajah. Model dan perangkat lunak memiliki ketentuan penggunaan masing-masing.
