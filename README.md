@@ -26,10 +26,6 @@ Use 64-bit Windows, Python 3.12, and PowerShell. From the project folder, run:
 
 This installs the CPU setup. Add `-Gpu` for NVIDIA acceleration or `-AdaFace` to prepare the optional second recognition model. See [Windows setup details](docs/WINDOWS_SETUP.md), including how to enable AdaFace in Settings.
 
-## Language
-
-English | [日本語](README.ja.md) | [简体中文](README.zh.md) | [हिन्दी](README.hi.md) | [Español](README.es.md) | [العربية](README.ar.md) | [Français](README.fr.md) | [Bahasa Indonesia](README.id.md) | [한국어](README.ko.md) | [Русский](README.ru.md) | [Português](README.pt.md)
-
 ## Privacy and models
 
 VideoAtlas stores its index and generated face images on your PC. It does not upload video or face data. Setup verifies the downloaded SCRFD and Japanese-face models; AdaFace is downloaded and exported locally when requested. Third-party terms are saved beside the models. The project's [MIT License](LICENSE) does not cover third-party models or dependencies.

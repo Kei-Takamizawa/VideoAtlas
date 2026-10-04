@@ -33,5 +33,5 @@ Follow the six development phases in Section 35 when prioritizing new work. Do n
 - Implement software and application UI in English by default.
 - Use English for code and general documentation intended for GitHub. User-only material may be Japanese.
 - Write README content for first-time visitors and non-engineers, emphasizing what the application can do and keeping technical detail limited.
-- Keep English as the default README and retain navigation to Japanese, Chinese, Hindi, Spanish, Arabic, French, Indonesian, Korean, Russian, and Portuguese versions.
+- Keep README documentation in English only; do not add translated README files or language navigation.
 - The user's original Japanese design is kept locally in `docs/private/design-specification.ja.md`. It is excluded from Git; the public development specification is `docs/design-specification.md`.
