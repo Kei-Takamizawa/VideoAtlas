@@ -1,8 +1,14 @@
-# Project Instructions
+# Claude Development Instructions
+
+## Development workflow
+
+Claude is the sole development assistant for this repository. Complete planning, implementation, review, and verification in the current Claude session. Do not require a Codex review, a second assistant's approval, or a Claude/Codex handoff loop to finish a task.
+
+Start with [the development guide](docs/DEVELOPMENT.md) for the repository map, Windows commands, and validation limits. Read the current implementation status before making claims about completed features. Keep each change scoped to the user's request, review the diff, and report the checks actually run and any remaining limitations.
 
 ## Authoritative specification
 
-Before planning or changing application behavior, read [the design specification](docs/design-specification.md). It is the baseline for future development and takes precedence over older descriptions of intended behavior in README files, setup guides, and `WINDOWS_HANDOFF.md`.
+Before planning or changing application behavior, read [the design specification](docs/design-specification.md). It is the baseline for future development and takes precedence over descriptions of intended behavior in README files and development or setup guides.
 
 The specification describes the target application. Existing code and historical implementation notes are not evidence that a requirement is complete. Keep current implementation status distinct from planned behavior. Resolve conflicts within the scope of the requested task; do not silently rewrite the specification or claim unmeasured accuracy.
 
@@ -20,9 +26,8 @@ Follow the six development phases in Section 35 when prioritizing new work. Do n
 - Support local Windows execution, CPU fallback, caching, incremental analysis, and replaceable model adapters.
 - Treat example settings and historical thresholds as uncalibrated until evaluated on representative videos.
 
-## Collaboration and evidence
+## Evidence
 
-- Use subagents for bounded tasks when useful, considering cost. Prefer a lower-cost capable model for simple audits. Never use Astra as a subagent.
 - Be candid and logical. Identify incorrect claims rather than agreeing for convenience. State when something is unknown; never invent results.
 - Seek current information when the task needs it. Verify changing technical facts using primary sources, and report dates or versions where relevant.
 - Prefer quantitative results when supported. Distinguish measurements, estimates, examples, and unverified assumptions.

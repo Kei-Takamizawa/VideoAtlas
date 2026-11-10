@@ -632,7 +632,7 @@ Combine high-quality face detection, tracking within videos, face quality evalua
 
 These notes identify decisions that the supplied design leaves open; they do not change the 38 sections above.
 
-- **Existing code is not the specification.** Older setup and handoff documents describe the current implementation, including MediaPipe-based alignment and provisional cosine-distance settings. They do not establish compliance with this design or calibrated HIGH/MEDIUM thresholds.
+- **Existing code is not the specification.** Development and setup guides describe implementation details; historical descriptions included MediaPipe-based alignment and provisional cosine-distance settings. They do not establish compliance with this design or calibrated HIGH/MEDIUM thresholds.
 - **Model integration remains to be verified.** Confirm the precise JAPANESE FACE V1 and AdaFace artifacts, versions, terms, and preprocessing against their primary sources when implementing them. A model name alone does not specify those details.
 - **Thresholds and score definitions remain open.** Define score ranges, similarity versus distance, match-rate denominators, ensemble calibration, and minimum evidence before choosing automatic merge thresholds. Do not turn example numbers into validated guarantees.
 - **Evaluation terminology must be precise.** A false-positive count is FP. The false-positive rate is `FP / (FP + TN)`; the fraction of predicted matches that are wrong is `FP / (TP + FP)`. Report the denominator and evaluation unit, such as track pairs or person merges. The source's priority is preventing different people from being merged; it supplies no numeric acceptance target or minimum reviewed sample count.

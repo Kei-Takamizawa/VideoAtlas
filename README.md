@@ -35,3 +35,7 @@ VideoAtlas stores its index and generated face images on your PC. It does not up
 The [project design](docs/design-specification.md) describes the planned application and its six development phases. It is the specification for future work, not a list of completed features.
 
 The analysis pipeline, reviewed decisions, cache updates, and GUI have been tested with genuine CPU and NVIDIA inference, synthetic clips, and a small supplied video collection. Recognition accuracy remains limited; simulated masks do not establish performance with real masks. See the dated [implementation and validation status](docs/IMPLEMENTATION_STATUS.md) for measured results and remaining limits. English and Japanese interfaces are available.
+
+## Development
+
+Development uses Claude with the repository instructions in [CLAUDE.md](CLAUDE.md). See the [development guide](docs/DEVELOPMENT.md) for the code map, workflow, and verification commands.
