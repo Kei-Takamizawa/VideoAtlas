@@ -210,7 +210,7 @@ def compare_models(run: RunData, models: list[str], labels: np.ndarray | None = 
 
 # ------------------------------------------------------------ grouping metrics
 
-REVIEW_BUDGETS = (0, 10, 25, 50, 100, 200)
+REVIEW_BUDGETS = (0, 10, 25, 50, 100, 200, 300, 500)
 
 
 def _majorities(group_of_face: np.ndarray, labels: np.ndarray) -> tuple[dict[int, Counter], dict[int, str]]:
