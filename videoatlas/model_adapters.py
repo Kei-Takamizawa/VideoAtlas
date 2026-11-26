@@ -69,6 +69,14 @@ def configure_windows_nvidia_libraries() -> None:
             os.environ["PATH"] = os.pathsep.join(additions+[os.environ.get("PATH", "")])
 
 
+GPU_REQUIRED_ACCELERATIONS = frozenset({"cuda", "tensorrt"})
+
+
+def gpu_required(options) -> bool:
+    """Explicit CUDA/TensorRT requests fail instead of silently running on the CPU."""
+    return getattr(options, "acceleration", "auto") in GPU_REQUIRED_ACCELERATIONS
+
+
 def artifact_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -201,7 +209,7 @@ def adaface_tensor(crop_bgr: np.ndarray) -> np.ndarray:
 
 
 class OnnxRunner:
-    """Explicit CPU retry after GPU initialization or execution failure."""
+    """GPU session with a logged CPU retry, or a hard failure when the GPU is required."""
     def __init__(self, path: Path, options) -> None:
         import onnxruntime as ort
         self.ort, self.path, self.options = ort, path, options
@@ -211,18 +219,33 @@ class OnnxRunner:
         config.intra_op_num_threads, config.inter_op_num_threads = options.threads, 1
         self.config = config
         self.lock = threading.RLock()
+        self.require_gpu = gpu_required(options)
         providers = ["CPUExecutionProvider"]
         if options.acceleration != "cpu":
             configure_windows_nvidia_libraries()
             if hasattr(ort,"preload_dlls"):
-                ort.preload_dlls()
+                try:
+                    ort.preload_dlls()
+                except Exception as error:
+                    LOG.warning("CUDA/cuDNN preload failed for %s: %s", path.name, error)
         if options.acceleration != "cpu" and "CUDAExecutionProvider" in ort.get_available_providers():
             providers.insert(0, ("CUDAExecutionProvider", {"device_id": options.gpu_device_id, "use_tf32": "0"}))
+        elif self.require_gpu:
+            raise RuntimeError(f"GPU acceleration was requested, but ONNX Runtime has no CUDA provider for {path.name}")
+        elif options.acceleration != "cpu":
+            LOG.warning("CUDA is unavailable; %s runs on the CPU", path.name)
         try:
             self.session = ort.InferenceSession(str(path), sess_options=config, providers=providers)
-        except Exception:
+        except Exception as error:
+            if self.require_gpu:
+                raise RuntimeError(f"GPU acceleration was requested, but {path.name} could not start on the GPU: {error}") from error
             LOG.exception("GPU model initialization failed; retrying on CPU")
             self.session = self.cpu_session()
+        if isinstance(providers[0], tuple) and self.session.get_providers()[0] == "CPUExecutionProvider":
+            # ONNX Runtime can register only the CPU provider without raising.
+            if self.require_gpu:
+                raise RuntimeError(f"GPU acceleration was requested, but {path.name} registered only the CPU provider")
+            LOG.warning("CUDA initialization fell back to the CPU for %s", path.name)
         self.session.disable_fallback()
         self.input = self.session.get_inputs()[0]
         self.outputs = self.session.get_outputs()
@@ -240,7 +263,7 @@ class OnnxRunner:
         try:
             return self.session.run([item.name for item in self.outputs], {self.input.name: tensor})
         except Exception:
-            if self.session.get_providers() == ["CPUExecutionProvider"]:
+            if self.session.get_providers() == ["CPUExecutionProvider"] or getattr(self, "require_gpu", False):
                 raise
             LOG.exception("GPU model execution failed; retrying on CPU")
             self.session = self.cpu_session()

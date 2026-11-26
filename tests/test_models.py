@@ -270,7 +270,7 @@ def test_windows_nvidia_bin_discovery_is_process_local_and_idempotent(tmp_path,m
         return SimpleNamespace(locate_file=lambda relative:tmp_path/relative)
     monkeypatch.setattr(model_adapters.importlib.metadata,'distribution',distribution)
     monkeypatch.setattr(model_adapters.sys,'platform','win32')
-    monkeypatch.setattr(model_adapters.os,'add_dll_directory',lambda path:registered.append(path) or object())
+    monkeypatch.setattr(model_adapters.os,'add_dll_directory',lambda path:registered.append(path) or object(),raising=False)
     monkeypatch.setattr(model_adapters,'_NVIDIA_DLL_HANDLES',{})
     monkeypatch.setenv('PATH','original-system-path')
     model_adapters.configure_windows_nvidia_libraries()
