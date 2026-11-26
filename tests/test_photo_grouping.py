@@ -310,3 +310,12 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
     groups = json.loads((tmp_path / "groups.json").read_text())
     assert groups["group_count"] == 2 and groups["evaluation"]["mixing"]["mixed_faces"] == 0
     assert groups["photos"]["A/broken.jpg"] == {"groups": [], "review_faces": [], "faces": 0}
+
+
+def test_two_faces_from_one_photo_cannot_both_attach_to_one_group():
+    group = [[1, 0, 0]] * 3
+    twins = [[.97, .1, 0], [.95, .2, 0]]
+    run = make_run([1, 1, 1, 2], group + twins)
+    result = group_faces(run, GroupingPolicy(("m",), merge_threshold=.999, attach_threshold=.8, min_group_size=3))
+    assert sorted(result.labels[3:].tolist()) == [UNGROUPED, 0]
+    assert result.labels[3] == 0  # the closer face wins

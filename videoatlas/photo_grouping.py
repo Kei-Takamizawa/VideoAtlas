@@ -247,25 +247,29 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
     leftovers = np.flatnonzero(labels == UNGROUPED)
     review: list[dict] = []
     if members and len(leftovers):
-        scores = np.stack([top_k_means(similarity[leftovers], group, policy.attach_top_k) for group in members], axis=1)
-        for position, face in enumerate(leftovers):
-            for group, group_members in enumerate(members):
-                if constraints[face, group_members].any():
-                    scores[position, group] = -math.inf
+        leftover_rows = similarity[leftovers]
+        leftover_constraints = constraints[leftovers]
+        scores = np.stack([top_k_means(leftover_rows, group, policy.attach_top_k) for group in members], axis=1)
+        # A group is closed to a face that is cannot-linked with any of its members.
+        group_blocked = np.stack([constraints[group].any(axis=0) for group in members])
+        scores[group_blocked[:, leftovers].T] = -math.inf
+        del leftover_rows, leftover_constraints
         if policy.attach_threshold is not None:
-            ordered = sorted(range(len(leftovers)), key=lambda position: -float(np.max(scores[position])))
-            for position in ordered:
-                face = leftovers[position]
-                if gated[face]:
+            if scores.shape[1] > 1:
+                top_two = np.partition(scores, -2, axis=1)[:, -2:]
+                best_scores, second_scores = top_two[:, 1], top_two[:, 0]
+            else:
+                best_scores, second_scores = scores[:, 0], np.full(len(leftovers), -math.inf)
+            best_groups = np.argmax(scores, axis=1)
+            eligible = (~gated[leftovers]) & (best_scores >= policy.attach_threshold) & (best_scores - second_scores >= policy.attach_margin)
+            for position in sorted(np.flatnonzero(eligible), key=lambda item: -float(best_scores[item])):
+                face, group = leftovers[position], int(best_groups[position])
+                # Two faces from one photo may both qualify; the stronger one takes the group.
+                if group_blocked[group, face]:
                     continue
-                row = scores[position]
-                best_group = int(np.argmax(row))
-                best = float(row[best_group])
-                second = float(np.partition(row, -2)[-2]) if len(row) > 1 else -math.inf
-                current = np.flatnonzero(labels == best_group)
-                if best >= policy.attach_threshold and best - second >= policy.attach_margin and not constraints[face, current].any():
-                    labels[face] = best_group
-                    attached[face] = True
+                labels[face] = group
+                attached[face] = True
+                group_blocked[group] |= constraints[face]
         threshold = policy.review_threshold if policy.review_threshold is not None else -math.inf
         for position, face in enumerate(leftovers):
             if labels[face] != UNGROUPED:
