@@ -46,7 +46,7 @@ Faces with an eye distance under 15 px are much harder for every model (AUC abou
 What the rounds show:
 
 - Most missing photos in rounds 1 and 2 were in a second group of the same person (makeup, age, lighting). A strict first step followed by the normalized cluster merge removes most of that split.
-- In round 4, a permissive setting merged all 119 faces of one person into the 555-face group of a similar-looking person. The training people could not reveal this risk, because the pair was split across folds. Round 5 shows the same jump without a safeguard (3.36% mixing).
+- In round 4, a permissive setting merged all 119 faces of one person into the 555-face group of a similar-looking person. The training people could not reveal this risk: when one of the two look-alike people is held out, the other one has no look-alike among the training people. Round 5 shows the same jump without a safeguard (3.36% mixing).
 - `cluster_auto_max_size` stops two large clusters from merging automatically; such pairs become merge suggestions. With a cap of 30, mixing stayed at or below 0.70% for every mixing limit tried, and no whole person was merged. At strict limits the cap did not reduce mixing (0.34% with the cap against 0.18% without it at the 0.05% limit, a difference of 6 faces).
 - The remaining mixed faces are single faces or pairs, mostly between SeoAh, JooBin, SeoYeon and Hitomi. Some may be filing errors in the answer key; 26 such photos were sent to the user for checking.
 
