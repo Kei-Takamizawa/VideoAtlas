@@ -414,7 +414,8 @@ class _Grid:
         key = (eye, merge)
         if key not in self.cluster_trees:
             similarity, constraints = self._blocks(eye)
-            self.cluster_trees[key] = merge_clusters(similarity, constraints, local, self.base.cluster_min_size, self.grid.cluster_floor)
+            self.cluster_trees[key] = merge_clusters(similarity, constraints, local, self.base.cluster_min_size, self.grid.cluster_floor,
+                                                     self.base.cluster_auto_max_size)
         cluster_of, cluster_merges = self.cluster_trees[key]
         return rows, apply_cluster_merges(cluster_of, cluster_merges, cluster)
 

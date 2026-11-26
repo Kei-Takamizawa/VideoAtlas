@@ -118,7 +118,8 @@ def _base_policy(args, run):
         offsets, scales = impostor_normalization(run, args.models)
     return GroupingPolicy(tuple(args.models), merge_threshold=0.0, attach_threshold=None, attach_margin=args.attach_margin,
                           attach_top_k=args.top_k, min_group_size=args.min_group_size, linkage=args.linkage,
-                          cluster_min_size=args.cluster_min_size, suggest_threshold=args.suggest_threshold,
+                          cluster_min_size=args.cluster_min_size, cluster_auto_max_size=args.cluster_auto_max_size,
+                          suggest_threshold=args.suggest_threshold,
                           max_suggestions=args.max_suggestions, offsets=offsets, scales=scales)
 
 
@@ -231,6 +232,8 @@ def add_photo_commands(commands, common) -> None:
     calibrate.add_argument("--cluster-grid", type=_optional_grid, default=[None],
                            help="cluster merge thresholds (normalized score); none turns the step off")
     calibrate.add_argument("--cluster-min-size", type=int, default=3)
+    calibrate.add_argument("--cluster-auto-max-size", type=int,
+                           help="largest smaller cluster in an automatic cluster merge; larger pairs only become suggestions")
     calibrate.add_argument("--attach-margin", type=float, default=0.05)
     calibrate.add_argument("--top-k", type=int, default=5)
     calibrate.add_argument("--min-group-size", type=int, default=2)

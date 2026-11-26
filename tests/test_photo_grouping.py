@@ -448,7 +448,7 @@ def test_cluster_sums_match_brute_force():
     assert np.allclose(sums.diagonal, [np.diag(similarity)[labels == value].sum() for value in sums.values], atol=1e-5)
 
 
-def reference_merge_clusters(similarity, constraints, labels, min_size, floor):
+def reference_merge_clusters(similarity, constraints, labels, min_size, floor, cap=None):
     """Recompute every cluster pair score after each merge (slow, obviously correct)."""
     from videoatlas.photo_grouping import ClusterSums
     _, cluster_of, counts = np.unique(labels, return_inverse=True, return_counts=True)
@@ -460,6 +460,8 @@ def reference_merge_clusters(similarity, constraints, labels, min_size, floor):
         scores = sums.scores(min_size)
         scores[~active] = -math.inf
         scores[:, ~active] = -math.inf
+        if cap is not None:
+            scores[np.minimum.outer(sums.sizes, sums.sizes) > cap] = -math.inf
         left, right = divmod(int(np.argmax(scores)), count)
         if not scores[left, right] >= floor:
             break
@@ -488,9 +490,28 @@ def test_incremental_cluster_merge_matches_full_recompute(seed):
     for a, b in generator.integers(0, 120, size=(15, 2)):
         if a != b:
             blocked[a, b] = blocked[b, a] = True
-    for min_size in (2, 3):
-        _, merges = merge_clusters(similarity, blocked, labels, min_size, -0.5)
-        expected = reference_merge_clusters(similarity, blocked, labels, min_size, -0.5)
+    for min_size, cap in ((2, None), (3, None), (2, 6)):
+        _, merges = merge_clusters(similarity, blocked, labels, min_size, -0.5, cap)
+        expected = reference_merge_clusters(similarity, blocked, labels, min_size, -0.5, cap)
         assert [merge[:2] for merge in merges] == [merge[:2] for merge in expected]
         assert np.allclose([merge[2] for merge in merges], [merge[2] for merge in expected], atol=1e-9)
         assert len(merges) > 5
+
+
+def test_two_large_clusters_become_a_suggestion_not_an_automatic_merge():
+    run = two_looks_and_a_stranger()
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    within_look = similarity[:8, :8][np.triu_indices(8, 1)].mean()
+    across_looks = similarity[:8, 8:16].mean()
+    merge = float((within_look + across_looks) / 2)
+    cluster = float(across_looks / within_look) - .05
+    free = group_faces(run, GroupingPolicy(("m",), merge_threshold=merge, cluster_merge_threshold=cluster))
+    assert free.labels[0] == free.labels[8]
+    capped = group_faces(run, GroupingPolicy(("m",), merge_threshold=merge, cluster_merge_threshold=cluster,
+                                             cluster_auto_max_size=7, suggest_threshold=cluster))
+    assert capped.labels[0] != capped.labels[8]  # both looks have 8 faces, above the cap
+    assert set(capped.suggestions[0]["groups"]) == {capped.labels[0], capped.labels[8]}
+    roomy = group_faces(run, GroupingPolicy(("m",), merge_threshold=merge, cluster_merge_threshold=cluster, cluster_auto_max_size=8))
+    assert roomy.labels[0] == roomy.labels[8]
+    with pytest.raises(ValueError):
+        GroupingPolicy(("m",), 0.5, cluster_auto_max_size=0).validate()

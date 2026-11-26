@@ -54,6 +54,10 @@ class GroupingPolicy:
     linkage: str = "average"
     cluster_merge_threshold: float | None = None
     cluster_min_size: int = 3
+    # Largest size of the smaller cluster in an automatic cluster merge. Two
+    # larger clusters are never merged automatically; they can only become a
+    # merge suggestion, so one wrong decision cannot join two whole people.
+    cluster_auto_max_size: int | None = None
     suggest_threshold: float | None = None
     max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
@@ -74,6 +78,8 @@ class GroupingPolicy:
             raise ValueError("scales must be positive")
         if self.linkage not in ("average", "complete"):
             raise ValueError("linkage must be average or complete")
+        if self.cluster_auto_max_size is not None and self.cluster_auto_max_size < 1:
+            raise ValueError("cluster_auto_max_size must be at least 1")
         if self.cluster_min_size < 2 or self.max_suggestions < 0:
             raise ValueError("cluster_min_size must be at least 2 and max_suggestions not negative")
         if self.min_group_size < 2 or self.attach_top_k < 1:
@@ -241,13 +247,15 @@ class ClusterSums:
 
 
 def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray, min_size: int,
-                   floor: float | None) -> tuple[np.ndarray, list[tuple[int, int, float]]]:
+                   floor: float | None, max_smaller: int | None = None) -> tuple[np.ndarray, list[tuple[int, int, float]]]:
     """Greedily merge the cluster pair with the highest normalized score, down to ``floor``.
 
     Returns the cluster index of every item and the merges in order. The order
     does not depend on the final threshold, so any threshold at or above floor
     is applied by taking the merges before the first one below it. Clusters
     smaller than ``min_size`` never take part, so only larger ones are scored.
+    With ``max_smaller``, a pair whose smaller cluster has more items than
+    that is never merged.
     """
     _, cluster_of, counts = np.unique(labels, return_inverse=True, return_counts=True)
     cluster_of = cluster_of.reshape(-1)
@@ -262,6 +270,8 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
     active = np.ones(count, bool)
     scores = sums.scores(min_size)
     sizes = sums.sizes
+    if max_smaller is not None:
+        scores[np.minimum.outer(sizes, sizes) > max_smaller] = -math.inf
     with np.errstate(divide="ignore", invalid="ignore"):
         within = (np.diag(sums.cross) - sums.diagonal) / (sizes * (sizes - 1))
     while True:
@@ -287,6 +297,8 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
         with np.errstate(divide="ignore", invalid="ignore"):
             row = sums.cross[keep] / (sizes[keep] * sizes) / np.sqrt(within[keep] * within)
         allowed = active & (sizes >= min_size) & (within > 0) & ~sums.blocked[keep] & np.isfinite(row)
+        if max_smaller is not None:
+            allowed &= np.minimum(sizes[keep], sizes) <= max_smaller
         if not within[keep] > 0:
             allowed[:] = False
         row[~allowed] = -math.inf
@@ -312,7 +324,8 @@ def apply_cluster_merges(cluster_of: np.ndarray, merges: list[tuple[int, int, fl
 def stage_two(similarity: np.ndarray, constraints: np.ndarray, local_labels: np.ndarray, policy: "GroupingPolicy") -> np.ndarray:
     if policy.cluster_merge_threshold is None or not len(local_labels):
         return local_labels
-    cluster_of, merges = merge_clusters(similarity, constraints, local_labels, policy.cluster_min_size, policy.cluster_merge_threshold)
+    cluster_of, merges = merge_clusters(similarity, constraints, local_labels, policy.cluster_min_size, policy.cluster_merge_threshold,
+                                        policy.cluster_auto_max_size)
     return apply_cluster_merges(cluster_of, merges, policy.cluster_merge_threshold)
 
 
