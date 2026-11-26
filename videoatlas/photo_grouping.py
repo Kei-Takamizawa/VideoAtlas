@@ -10,10 +10,17 @@ evaluation on labelled photos chooses them (see ``photo_evaluation``).
    threshold, so one close pair cannot chain two people together. Faces from the
    same photo are different people and never share a cluster (cannot-link), and
    neither do faces that the user marked as different people.
-3. Attach: a face left alone may join a group when the mean of its top-k
+3. Cluster merge (optional): clusters of one person are often split by
+   makeup, age, or lighting. Two clusters of at least ``cluster_min_size``
+   faces merge when their mean cross similarity, divided by the geometric mean
+   of their own mean internal similarities, reaches ``cluster_merge_threshold``.
+   This compares how close two clusters are with how tight each one is.
+4. Attach: a face left alone may join a group when the mean of its top-k
    similarities to that group's faces reaches the attach threshold, and the best
    group leads the second-best group by a margin. Otherwise it is listed for
    review with its candidate groups.
+5. Suggestions: group pairs whose normalized score reaches
+   ``suggest_threshold`` are listed for the user to confirm or reject.
 
 Several models can be fused only through a per-model affine score normalization
 and a weighted mean. Embeddings themselves are never mixed.
@@ -45,6 +52,10 @@ class GroupingPolicy:
     min_eye_distance: float = 0.0
     max_abs_yaw_ratio: float | None = None
     linkage: str = "average"
+    cluster_merge_threshold: float | None = None
+    cluster_min_size: int = 3
+    suggest_threshold: float | None = None
+    max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
     # Score normalization per model: normalized = (cosine - offset) / scale.
     offsets: tuple[float, ...] | None = None
@@ -63,6 +74,8 @@ class GroupingPolicy:
             raise ValueError("scales must be positive")
         if self.linkage not in ("average", "complete"):
             raise ValueError("linkage must be average or complete")
+        if self.cluster_min_size < 2 or self.max_suggestions < 0:
+            raise ValueError("cluster_min_size must be at least 2 and max_suggestions not negative")
         if self.min_group_size < 2 or self.attach_top_k < 1:
             raise ValueError("min_group_size must be at least 2 and attach_top_k at least 1")
         if not all(math.isfinite(value) for value in (self.merge_threshold, self.attach_margin, self.min_eye_distance)):
@@ -193,6 +206,118 @@ def top_k_means(similarity_rows: np.ndarray, members: np.ndarray, k: int) -> np.
     return np.partition(block, -take, axis=1)[:, -take:].mean(axis=1)
 
 
+class ClusterSums:
+    """Sums of pairwise similarities within and between clusters, for cluster-level scores."""
+
+    def __init__(self, similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray) -> None:
+        values, inverse = np.unique(labels, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        count = len(values)
+        onehot = np.zeros((len(inverse), count), np.float32)
+        onehot[np.arange(len(inverse)), inverse] = 1
+        # float32 row sums (relative error ~1e-6 here), then float64 for the cluster totals.
+        partial = np.asarray(similarity, np.float32) @ onehot
+        self.cross = onehot.T.astype(np.float64) @ partial.astype(np.float64)
+        self.diagonal = np.bincount(inverse, weights=np.diag(similarity).astype(np.float64), minlength=count)
+        left, right = np.nonzero(constraints)
+        self.blocked = np.zeros((count, count), bool)
+        self.blocked[inverse[left], inverse[right]] = True
+        self.sizes = np.bincount(inverse, minlength=count).astype(np.float64)
+        self.values = values
+        self.inverse = inverse
+
+    def scores(self, min_size: int) -> np.ndarray:
+        """Normalized score for every cluster pair; -inf where not allowed."""
+        sizes = self.sizes
+        pairs_inside = sizes * (sizes - 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            within = (np.diag(self.cross) - self.diagonal) / pairs_inside
+            cross_mean = self.cross / np.outer(sizes, sizes)
+            scores = cross_mean / np.sqrt(np.outer(within, within))
+        valid = (sizes >= min_size) & (within > 0)
+        scores[~np.outer(valid, valid) | self.blocked | ~np.isfinite(scores)] = -math.inf
+        np.fill_diagonal(scores, -math.inf)
+        return scores
+
+
+def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray, min_size: int,
+                   floor: float | None) -> tuple[np.ndarray, list[tuple[int, int, float]]]:
+    """Greedily merge the cluster pair with the highest normalized score, down to ``floor``.
+
+    Returns the cluster index of every item and the merges in order. The order
+    does not depend on the final threshold, so any threshold at or above floor
+    is applied by taking the merges before the first one below it. Clusters
+    smaller than ``min_size`` never take part, so only larger ones are scored.
+    """
+    _, cluster_of, counts = np.unique(labels, return_inverse=True, return_counts=True)
+    cluster_of = cluster_of.reshape(-1)
+    merges: list[tuple[int, int, float]] = []
+    big = np.flatnonzero(counts >= min_size)
+    if floor is None or len(big) < 2:
+        return cluster_of, merges
+    items = np.flatnonzero(np.isin(cluster_of, big))
+    sums = ClusterSums(similarity[np.ix_(items, items)], constraints[np.ix_(items, items)], cluster_of[items])
+    ids = sums.values  # cluster index of each local cluster
+    count = len(ids)
+    active = np.ones(count, bool)
+    scores = sums.scores(min_size)
+    while True:
+        flat = int(np.argmax(scores))
+        left, right = divmod(flat, count)
+        best = float(scores[left, right])
+        if not best >= floor:
+            break
+        keep, drop = min(left, right), max(left, right)
+        merges.append((int(ids[keep]), int(ids[drop]), best))
+        sums.cross[keep] += sums.cross[drop]
+        sums.cross[:, keep] += sums.cross[:, drop]
+        sums.diagonal[keep] += sums.diagonal[drop]
+        sums.sizes[keep] += sums.sizes[drop]
+        sums.blocked[keep] |= sums.blocked[drop]
+        sums.blocked[:, keep] = sums.blocked[keep]
+        active[drop] = False
+        sums.sizes[drop] = 0
+        sums.cross[drop] = 0
+        sums.cross[:, drop] = 0
+        scores = sums.scores(min_size)
+        scores[~active] = -math.inf
+        scores[:, ~active] = -math.inf
+    return cluster_of, merges
+
+
+def apply_cluster_merges(cluster_of: np.ndarray, merges: list[tuple[int, int, float]], threshold: float | None) -> np.ndarray:
+    """Cluster label per item after the merges that come before the first one below threshold."""
+    parent = np.arange(int(cluster_of.max()) + 1 if len(cluster_of) else 0)
+    if threshold is not None:
+        for keep, drop, score in merges:
+            if score < threshold:
+                break
+            parent[parent == drop] = keep
+    return parent[cluster_of]
+
+
+def stage_two(similarity: np.ndarray, constraints: np.ndarray, local_labels: np.ndarray, policy: "GroupingPolicy") -> np.ndarray:
+    if policy.cluster_merge_threshold is None or not len(local_labels):
+        return local_labels
+    cluster_of, merges = merge_clusters(similarity, constraints, local_labels, policy.cluster_min_size, policy.cluster_merge_threshold)
+    return apply_cluster_merges(cluster_of, merges, policy.cluster_merge_threshold)
+
+
+def group_suggestions(similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray, threshold: float | None,
+                      limit: int) -> list[dict]:
+    """Group pairs that may be one person, strongest first, for the user to confirm."""
+    grouped = np.flatnonzero(labels != UNGROUPED)
+    if threshold is None or limit == 0 or not len(grouped):
+        return []
+    sums = ClusterSums(similarity[np.ix_(grouped, grouped)], constraints[np.ix_(grouped, grouped)], labels[grouped])
+    scores = sums.scores(2)
+    upper = np.triu(np.ones_like(scores, dtype=bool), k=1)
+    left, right = np.nonzero(upper & (scores >= threshold))
+    order = np.argsort(-scores[left, right], kind="stable")[:limit]
+    return [{"groups": [int(sums.values[left[index]]), int(sums.values[right[index]])], "score": round(float(scores[left[index], right[index]]), 4)}
+            for index in order]
+
+
 @dataclass
 class GroupingResult:
     policy: GroupingPolicy
@@ -202,6 +327,7 @@ class GroupingResult:
     attached: np.ndarray                   # True for faces that joined a group in the attach step
     gated: np.ndarray                      # True for faces that the gate kept out of automatic grouping
     review: list[dict]                     # faces left for review, with candidate groups
+    suggestions: list[dict] = field(default_factory=list)  # group pairs that may be one person
 
 
 def gate_mask(faces: list[dict], policy: GroupingPolicy) -> np.ndarray:
@@ -217,7 +343,6 @@ def group_faces(run: RunData, policy: GroupingPolicy, cannot_link: np.ndarray | 
                 similarity: np.ndarray | None = None, merges: list | None = None) -> GroupingResult:
     """Group every usable face in a run. ``cannot_link`` may add user decisions."""
     policy.validate()
-    count = len(run.faces)
     passed = gate_mask(run.faces, policy)
     similarity = fused_similarity(run.embeddings, policy) if similarity is None else similarity
     constraints = same_photo_constraints(run.face_photo)
@@ -227,33 +352,48 @@ def group_faces(run: RunData, policy: GroupingPolicy, cannot_link: np.ndarray | 
     if merges is None:
         merges = agglomerate(similarity[np.ix_(rows, rows)], constraints[np.ix_(rows, rows)], policy.linkage, policy.merge_threshold)
     local = cut(merges, len(rows), policy.merge_threshold)
+    local = stage_two(similarity[np.ix_(rows, rows)], constraints[np.ix_(rows, rows)], local, policy)
     return finish_grouping(run, policy, similarity, constraints, rows, local)
 
 
 def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray, constraints: np.ndarray,
-                    rows: np.ndarray, local_labels: np.ndarray) -> GroupingResult:
+                    rows: np.ndarray, local_labels: np.ndarray, cache: dict | None = None,
+                    review_candidates: bool = True) -> GroupingResult:
+    """Form groups from cluster labels, then attach leftovers, list review faces, and suggest merges.
+
+    ``cache`` may hold attach scores between calls that share every input
+    except the attach and suggestion settings. ``review_candidates=False``
+    lists review faces without candidate groups, which is faster.
+    """
     count = len(run.faces)
     labels = np.full(count, UNGROUPED, np.int64)
-    unique, sizes = np.unique(local_labels, return_counts=True)
-    big = [value for value, size in sorted(zip(unique, sizes), key=lambda item: (-item[1], item[0])) if size >= policy.min_group_size]
-    index_of = {value: number for number, value in enumerate(big)}
-    for row, value in zip(rows, local_labels):
-        if value in index_of:
-            labels[row] = index_of[value]
+    unique, inverse, sizes = np.unique(local_labels, return_inverse=True, return_counts=True)
+    order = np.lexsort((unique, -sizes))  # largest first, then by cluster label
+    big = order[sizes[order] >= policy.min_group_size]
+    index_of = np.full(len(unique), UNGROUPED, np.int64)
+    index_of[big] = np.arange(len(big))
+    labels[rows] = index_of[inverse.reshape(-1)]
+    group_count = len(big)
     attached = np.zeros(count, bool)
     gated = np.ones(count, bool)
     gated[rows] = False
-    members = [np.flatnonzero(labels == group) for group in range(len(big))]
+    grouped = np.flatnonzero(labels != UNGROUPED)
+    by_group = grouped[np.argsort(labels[grouped], kind="stable")]
+    members = np.split(by_group, np.cumsum(np.bincount(labels[grouped], minlength=group_count))[:-1]) if group_count else []
     leftovers = np.flatnonzero(labels == UNGROUPED)
-    review: list[dict] = []
-    if members and len(leftovers):
-        leftover_rows = similarity[leftovers]
-        leftover_constraints = constraints[leftovers]
-        scores = np.stack([top_k_means(leftover_rows, group, policy.attach_top_k) for group in members], axis=1)
-        # A group is closed to a face that is cannot-linked with any of its members.
-        group_blocked = np.stack([constraints[group].any(axis=0) for group in members])
-        scores[group_blocked[:, leftovers].T] = -math.inf
-        del leftover_rows, leftover_constraints
+    scores = None
+    if group_count and len(leftovers):
+        if cache is not None and "scores" in cache:
+            scores, group_blocked = cache["scores"], cache["group_blocked"].copy()
+        else:
+            leftover_rows = similarity[leftovers]
+            scores = np.stack([top_k_means(leftover_rows, group, policy.attach_top_k) for group in members], axis=1)
+            del leftover_rows
+            # A group is closed to a face that is cannot-linked with any of its members.
+            group_blocked = np.stack([constraints[group].any(axis=0) for group in members])
+            scores[group_blocked[:, leftovers].T] = -math.inf
+            if cache is not None:
+                cache["scores"], cache["group_blocked"] = scores, group_blocked.copy()
         if policy.attach_threshold is not None:
             if scores.shape[1] > 1:
                 top_two = np.partition(scores, -2, axis=1)[:, -2:]
@@ -272,19 +412,24 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
                 labels[face] = group
                 attached[face] = True
                 group_blocked[group] |= constraints[face]
+    remaining = np.flatnonzero(labels[leftovers] == UNGROUPED)
+    candidates: list[list[dict]] = [[] for _ in remaining]
+    if scores is not None and review_candidates and len(remaining):
         threshold = policy.review_threshold if policy.review_threshold is not None else -math.inf
-        for position, face in enumerate(leftovers):
-            if labels[face] != UNGROUPED:
-                continue
-            row = scores[position]
-            order = [int(group) for group in np.argsort(-row)[:3] if row[group] >= threshold and math.isfinite(row[group])]
-            review.append({"face": run.faces[face]["id"], "photo": run.faces[face]["photo"], "gated": bool(gated[face]),
-                           "candidates": [{"group": group, "score": round(float(row[group]), 4)} for group in order]})
-    else:
-        review = [{"face": run.faces[face]["id"], "photo": run.faces[face]["photo"], "gated": bool(gated[face]), "candidates": []}
-                  for face in leftovers]
-    sizes_out = [int(np.sum(labels == group)) for group in range(len(big))]
-    return GroupingResult(policy, run.face_ids, labels, sizes_out, attached, gated, review)
+        block = scores[remaining]
+        take = min(3, block.shape[1])
+        top = np.argpartition(-block, take - 1, axis=1)[:, :take] if block.shape[1] > take else np.tile(np.arange(take), (len(remaining), 1))
+        top_scores = np.take_along_axis(block, top, axis=1)
+        ranking = np.argsort(-top_scores, axis=1, kind="stable")
+        top, top_scores = np.take_along_axis(top, ranking, axis=1), np.take_along_axis(top_scores, ranking, axis=1)
+        for index in range(len(remaining)):
+            candidates[index] = [{"group": int(group), "score": round(float(score), 4)} for group, score in zip(top[index], top_scores[index])
+                                 if score >= threshold and math.isfinite(score)]
+    review = [{"face": run.faces[face]["id"], "photo": run.faces[face]["photo"], "gated": bool(gated[face]), "candidates": candidates[index]}
+              for index, face in enumerate(leftovers[remaining])]
+    sizes_out = np.bincount(labels[labels != UNGROUPED], minlength=group_count).astype(int).tolist()
+    suggestions = group_suggestions(similarity, constraints, labels, policy.suggest_threshold, policy.max_suggestions)
+    return GroupingResult(policy, run.face_ids, labels, sizes_out, attached, gated, review, suggestions)
 
 
 def group_name(index: int) -> str:
@@ -318,8 +463,11 @@ def groups_document(run: RunData, result: GroupingResult, run_folder: str | None
     return {"format": "videoatlas-photo-groups-v1", "run": run_folder, "policy": result.policy.to_json(),
             "embedding_keys": {name: run.keys[name] for name in result.policy.models},
             "group_count": len(groups), "groups": groups, "photos": photos, "review": review,
+            "merge_suggestions": [{"groups": [group_name(item["groups"][0]), group_name(item["groups"][1])], "score": item["score"]}
+                                  for item in result.suggestions],
             "notes": ["A photo with several people appears in each of their groups.",
-                      "Faces in the review list did not meet the automatic thresholds; candidates are suggestions only."]}
+                      "Faces in the review list did not meet the automatic thresholds; candidates are suggestions only.",
+                      "Merge suggestions name group pairs that may be one person; only the user's confirmation merges them."]}
 
 
 def write_groups(path: Path, document: dict) -> None:

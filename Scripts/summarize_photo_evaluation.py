@@ -1,8 +1,11 @@
 """Print a short digest of a photo evaluation run (verify.json and calibration-*.json).
 
-    python Scripts/summarize_photo_evaluation.py RUN_FOLDER
+    python Scripts/summarize_photo_evaluation.py RUN_FOLDER [--intruders]
 
 The digest holds counts, rates, thresholds, and person folder names only.
+With --intruders it also lists the photo paths of faces that were grouped
+with another person in the held-out measurement, so that a person can check
+whether the label or the grouping is wrong.
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ def num(value, digits: int = 3) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
-def main(folder: str) -> int:
+def main(folder: str, intruders: bool = False) -> int:
     run = Path(folder)
     report = json.loads((run / "report.json").read_text(encoding="utf-8"))
     print(f"Run {run}: {report['image_count']} photos, {report['elapsed_seconds']} s, providers {report['providers']}")
@@ -45,32 +48,49 @@ def main(folder: str) -> int:
                 f"{p['person']} {num(p['median_same_person_score'], 2)}/{num(p['median_best_other_person_score'], 2)}" for p in entry["per_person"]))
     for path in sorted(run.glob("calibration-*.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
-        held = data["held_out"]["held_out"]
-        print(f"\nCalibration {path.stem} (max mixing {pct(data['max_mixing_rate'])}, {data['elapsed_seconds']} s)")
-        print(f"  held-out: mixing {held['mixed_faces']}/{held['grouped_labelled_faces']} = {pct(held['mixing_rate'])}; "
-              f"missing {held['photos'] - held['found_in_main_group']}/{held['photos']} = {pct(held['missing_rate'])} "
-              f"(no usable face {held['no_usable_face']}, review {held['left_for_review']}, other group of same person "
-              f"{held['in_other_group_of_person']}, only in other people's groups {held['only_in_other_people_groups']})")
-        for fold in data["held_out"]["folds"]:
+        grid = data["grid"]
+        print(f"\nCalibration {path.stem}: {grid['settings']} settings, {data['elapsed_seconds']} s "
+              f"(merge {grid['merge'][0]}..{grid['merge'][-1]}, attach {grid['attach']}, eye {grid['min_eye_distance']}, "
+              f"cluster merge {grid['cluster_merge']})")
+        print("  held-out estimate by mixing limit (limit applied on the other people):")
+        for target, entry in data["held_out"]["targets"].items():
+            held = entry["held_out"]
+            review = "; ".join(f"{row['budget']}: {pct(row['missing_rate'])}" for row in held["after_review"] if row["budget"])
+            print(f"  - limit {pct(float(target))}: mixing {held['mixed_faces']}/{held['grouped_labelled_faces']} = {pct(held['mixing_rate'])}; "
+                  f"missing {held['photos'] - held['found_in_main_group']}/{held['photos']} = {pct(held['missing_rate'])} "
+                  f"(no usable face {held['no_usable_face']}, review {held['left_for_review']}, other group of same person "
+                  f"{held['in_other_group_of_person']}, only in other people's groups {held['only_in_other_people_groups']})"
+                  + (f"; folds without a setting {held['folds_without_setting']}" if held["folds_without_setting"] else ""))
+            if review:
+                print(f"      missing after answering the first N merge suggestions: {review}")
+        target = str(float(data["policy_target"]))
+        print(f"  folds at limit {pct(float(target))}:")
+        for fold in data["held_out"]["targets"].get(target, {}).get("folds", []):
             policy = fold.get("policy")
             if policy is None:
                 print(f"  - {fold['held_out']}: no setting met the limit")
                 continue
-            person = fold["held_out_person"]
-            print(f"  - {fold['held_out']}: eye>={policy['min_eye_distance']} merge {policy['merge_threshold']} attach {policy['attach_threshold']} "
-                  f"| mixed {fold['held_out_mixed_faces']}/{fold['held_out_grouped_labelled_faces']} in {fold['held_out_mixed_groups']} groups "
-                  f"| missing {pct(person['missing_rate'])} of {person['photos']} (groups led {person['groups_led']}, main group {person['main_group_size']})")
-            for detail in fold["held_out_mixing_details"][:3]:
+            person = fold["person"]
+            print(f"  - {fold['held_out']}: eye>={policy['min_eye_distance']} merge {policy['merge_threshold']} "
+                  f"cluster {policy['cluster_merge_threshold']} attach {policy['attach_threshold']} "
+                  f"| mixed {fold['mixed_faces']}/{fold['grouped_labelled_faces']} in {fold['mixed_groups']} groups "
+                  f"| missing {pct(person['missing_rate'])} of {person['photos']} (groups led {person['groups_led']}, "
+                  f"main group {person['main_group_size']}, suggestions {fold['merge_suggestions']})")
+            for detail in fold["mixing_details"][:3]:
                 print(f"      mixed group size {detail['size']} led by {detail['majority']}: intruders {detail['intruders']}")
-        chosen = data["all_people"]
-        if chosen["policy"]:
-            metrics = chosen["metrics"]
-            policy = chosen["policy"]
-            print(f"  all people (optimistic): eye>={policy['min_eye_distance']} merge {policy['merge_threshold']} attach {policy['attach_threshold']} | "
-                  f"groups {metrics['groups']}, review faces {metrics['review_faces']}, mixing {pct(metrics['mixing']['mixing_rate'])}, "
+                if intruders:
+                    for photo in detail.get("intruder_photos", []):
+                        print(f"        {photo}")
+        for target, chosen in data["all_people"]["targets"].items():
+            policy, metrics = chosen["policy"], chosen["metrics"]
+            if not policy:
+                continue
+            print(f"  all people, limit {pct(float(target))} (optimistic): eye>={policy['min_eye_distance']} merge {policy['merge_threshold']} "
+                  f"cluster {policy['cluster_merge_threshold']} attach {policy['attach_threshold']} | groups {metrics['groups']}, "
+                  f"review faces {metrics['review_faces']}, mixing {pct(metrics['mixing']['mixing_rate'])}, "
                   f"missing {pct(metrics['missing']['missing_rate'])}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1]))
+    raise SystemExit(main(sys.argv[1], "--intruders" in sys.argv[2:]))

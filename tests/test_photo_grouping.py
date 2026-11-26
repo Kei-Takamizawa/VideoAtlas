@@ -10,10 +10,11 @@ import pytest
 
 from videoatlas import cli
 from videoatlas.embedders import EMBEDDERS, EmbedderSpec, OnnxEmbedder, face_tensor, insightface_normalization, resolve_spec
-from videoatlas.photo_evaluation import (calibrate_leave_one_person_out, choose_policy, compare_models, face_labels,
-                                         grouping_metrics, verification_report, _curve_metrics, _histogram)
-from videoatlas.photo_grouping import (UNGROUPED, GroupingPolicy, agglomerate, cut, group_faces, groups_document,
-                                       same_photo_constraints)
+from videoatlas.photo_evaluation import (SearchGrid, add_fused_embedding, calibrate_leave_one_person_out, choose_policy,
+                                         compare_models, face_labels, grouping_metrics, simulate_review, verification_report,
+                                         _curve_metrics, _histogram, photo_labels)
+from videoatlas.photo_grouping import (UNGROUPED, GroupingPolicy, agglomerate, apply_cluster_merges, cut, group_faces,
+                                       groups_document, merge_clusters, same_photo_constraints)
 from videoatlas.photos import PhotoAnalyzer, RunData, analyze_folder, face_geometry, load_run
 
 
@@ -167,11 +168,13 @@ def synthetic_people(people=5, photos=12, spread=.35, seed=0):
 def test_leave_one_person_out_calibration_reports_held_out_errors():
     run = synthetic_people()
     base = GroupingPolicy(("m",), merge_threshold=0.0)
-    report = calibrate_leave_one_person_out(run, base, [.3, .5, .7], [None, .6], [0.0], max_mixing_rate=0.0)
-    assert len(report["folds"]) == 5
-    assert report["held_out"]["mixed_faces"] == 0
-    assert report["held_out"]["photos"] == 60 and report["held_out"]["missing_rate"] < .2
-    policy, metrics, table = choose_policy(run, base, [.3, .5, .7], [None], [0.0], max_mixing_rate=0.0)
+    report = calibrate_leave_one_person_out(run, base, SearchGrid((.3, .5, .7), (None, .6)), [0.0, 0.01])
+    assert set(report["targets"]) == {"0.0", "0.01"}
+    strict = report["targets"]["0.0"]
+    assert len(strict["folds"]) == 5 and strict["held_out"]["folds_without_setting"] == 0
+    assert strict["held_out"]["mixed_faces"] == 0
+    assert strict["held_out"]["photos"] == 60 and strict["held_out"]["missing_rate"] < .2
+    policy, metrics, table = choose_policy(run, base, SearchGrid((.3, .5, .7)), 0.0)
     assert policy is not None and metrics["mixing"]["mixed_faces"] == 0 and len(table) == 3
 
 
@@ -305,9 +308,15 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
     assert cli.main(["photos", "verify", str(run_folder), "--models", "fake", "--output", str(tmp_path / "verify.json"), "--bootstrap", "20"]) == 0
     assert cli.main(["photos", "calibrate", str(run_folder), "--models", "fake", "--output", str(tmp_path / "calibration.json"),
                      "--policy-output", str(tmp_path / "policy.json"), "--merge-grid", "0.5:0.9:0.2", "--attach-grid", "none",
-                     "--eye-grid", "0", "--max-mixing", "0"]) == 0
+                     "--eye-grid", "0", "--cluster-grid", "none,0.8", "--targets", "0", "--policy-target", "0",
+                     "--suggest-threshold", "0.5"]) == 0
     calibration = json.loads((tmp_path / "calibration.json").read_text())
-    assert calibration["held_out"]["held_out"]["mixed_faces"] == 0
+    assert calibration["held_out"]["targets"]["0.0"]["held_out"]["mixed_faces"] == 0
+    assert calibration["grid"]["settings"] == 6
+    assert json.loads((tmp_path / "policy.json").read_text())["calibration"]["max_mixing_rate"] == 0
+    assert cli.main(["photos", "verify", str(run_folder), "--models", "fake", "--fuse", "fake,fake", "--output", str(tmp_path / "verify2.json"),
+                     "--bootstrap", "5"]) == 0
+    assert "fake,fake" in json.loads((tmp_path / "verify2.json").read_text())["models"]
     assert cli.main(["photos", "group", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--output", str(tmp_path / "groups.json")]) == 0
     groups = json.loads((tmp_path / "groups.json").read_text())
     assert groups["group_count"] == 2 and groups["evaluation"]["mixing"]["mixed_faces"] == 0
@@ -332,3 +341,108 @@ def test_identification_counts_unknown_people_as_wrong_when_accepted():
     assert loose["unknown_accepted"] > 0 and loose["wrong_rate"] > .2
     assert strict["unknown_accepted"] == 0 and strict["known_wrong"] == 0
     assert report["enroll_sizes"]["3"]["best_within_limit"]["wrong_rate"] <= .001
+
+
+def two_looks_and_a_stranger(seed=0):
+    """Person A appears in two looks that average linkage keeps apart; B is another person."""
+    generator = np.random.default_rng(seed)
+    dims = 64
+    base_a = generator.normal(size=dims)
+    shift = generator.normal(size=dims)
+    look1 = base_a + 0.5 * shift
+    look2 = base_a - 0.5 * shift
+    other = generator.normal(size=dims)
+    vectors, labels = [], []
+    for center, label, count in ((look1, "A", 8), (look2, "A", 8), (other, "B", 8)):
+        for _ in range(count):
+            vectors.append(center + generator.normal(scale=.45, size=dims))
+            labels.append(label)
+    return make_run([1] * len(labels), vectors, labels=labels)
+
+
+def test_cluster_merge_joins_two_looks_of_one_person_but_not_a_stranger():
+    run = two_looks_and_a_stranger()
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    within_look = similarity[:8, :8][np.triu_indices(8, 1)].mean()
+    across_looks = similarity[:8, 8:16].mean()
+    to_stranger = similarity[:16, 16:].mean()
+    assert within_look > across_looks > to_stranger
+    merge = float((within_look + across_looks) / 2)
+    first = group_faces(run, GroupingPolicy(("m",), merge_threshold=merge))
+    assert first.labels[0] != first.labels[8]  # the looks stay apart in the first step
+    score = across_looks / within_look
+    second = group_faces(run, GroupingPolicy(("m",), merge_threshold=merge, cluster_merge_threshold=float(score) - .05))
+    assert len(set(second.labels[:16].tolist())) == 1
+    assert second.labels[16] != second.labels[0]
+    assert grouping_metrics(run, second)["mixing"]["mixed_faces"] == 0
+
+
+def test_cluster_merge_respects_cannot_link_and_prefix_cut():
+    run = two_looks_and_a_stranger()
+    similarity = (run.embeddings["m"] @ run.embeddings["m"].T).astype(np.float32)
+    labels = np.asarray([0] * 8 + [8] * 8 + [16] * 8)
+    blocked = np.zeros_like(similarity, bool)
+    blocked[0, 8] = blocked[8, 0] = True
+    cluster_of, merges = merge_clusters(similarity, blocked, labels, 3, -1.0)
+    joined = apply_cluster_merges(cluster_of, merges, -1.0)
+    assert joined[0] != joined[8]  # a user decision between the looks blocks the merge
+    cluster_of, merges = merge_clusters(similarity, np.zeros_like(blocked), labels, 3, -1.0)
+    assert [merge[:2] for merge in merges][0] == (0, 1)
+    assert len(set(apply_cluster_merges(cluster_of, merges, merges[0][2]).tolist())) == 2
+    assert len(set(apply_cluster_merges(cluster_of, merges, None).tolist())) == 3
+    small = merge_clusters(similarity, np.zeros_like(blocked), labels, 9, -1.0)[1]
+    assert small == []  # clusters below the minimum size never merge
+
+
+def test_merge_suggestions_and_review_simulation():
+    run = two_looks_and_a_stranger()
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    within_look = similarity[:8, :8][np.triu_indices(8, 1)].mean()
+    across_looks = similarity[:8, 8:16].mean()
+    policy = GroupingPolicy(("m",), merge_threshold=float((within_look + across_looks) / 2), suggest_threshold=-1.0)
+    result = group_faces(run, policy)
+    assert len(result.suggestions) == 3
+    first = result.suggestions[0]["groups"]
+    assert {result.labels[0], result.labels[8]} == set(first)
+    document = groups_document(run, result)
+    assert len(document["merge_suggestions"]) == 3 and document["merge_suggestions"][0]["groups"][0].startswith("g")
+    labels = face_labels(run)
+    rows = simulate_review(run, result, labels, photo_labels(run), {"A"}, budgets=(0, 1, 3))
+    assert rows[0]["missing_rate"] == .5 and rows[1]["missing_rate"] == 0
+    assert rows[1]["accepted"] == 1 and rows[2]["rejected"] == 2
+    metrics = grouping_metrics(run, result, review=True)
+    assert metrics["merge_suggestions"] == 3 and metrics["review_simulation"][0]["budget"] == 0
+
+
+def test_fused_embedding_orders_pairs_like_fused_similarity():
+    from videoatlas.photo_grouping import fused_similarity
+    from videoatlas.photo_evaluation import impostor_normalization
+    run = synthetic_people(people=4, photos=6)
+    noisy = run.embeddings["m"] + np.random.default_rng(2).normal(scale=.5, size=run.embeddings["m"].shape).astype(np.float32)
+    run.embeddings["n"] = unit(noisy)
+    run.keys["n"] = "n:key"
+    name = add_fused_embedding(run, ["m", "n"])
+    combined = run.embeddings[name] @ run.embeddings[name].T
+    offsets, scales = impostor_normalization(run, ["m", "n"])
+    fused = fused_similarity(run.embeddings, GroupingPolicy(("m", "n"), 0.0, offsets=offsets, scales=scales))
+    upper = np.triu_indices(len(combined), 1)
+    slope, intercept = np.polyfit(combined[upper], fused[upper], 1)
+    assert slope > 0 and np.allclose(combined[upper] * slope + intercept, fused[upper], atol=1e-4)
+    assert np.allclose(np.diag(combined), 1, atol=1e-5)
+
+
+def test_cluster_sums_match_brute_force():
+    from videoatlas.photo_grouping import ClusterSums
+    generator = np.random.default_rng(5)
+    similarity = generator.normal(size=(30, 30)).astype(np.float32)
+    similarity = (similarity + similarity.T) / 2
+    labels = generator.integers(0, 5, size=30) * 7
+    blocked = np.zeros((30, 30), bool)
+    blocked[2, 9] = blocked[9, 2] = True
+    sums = ClusterSums(similarity, blocked, labels)
+    for a, left in enumerate(sums.values):
+        for b, right in enumerate(sums.values):
+            block = similarity[np.ix_(labels == left, labels == right)]
+            assert math.isclose(sums.cross[a, b], float(block.astype(np.float64).sum()), rel_tol=1e-5, abs_tol=1e-4)
+    assert sums.blocked[list(sums.values).index(labels[2]), list(sums.values).index(labels[9])]
+    assert np.allclose(sums.diagonal, [np.diag(similarity)[labels == value].sum() for value in sums.values], atol=1e-5)

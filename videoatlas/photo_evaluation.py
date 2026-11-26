@@ -22,14 +22,14 @@ person being evaluated, then counts only errors that involve that person.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 from typing import Iterable
 
 import numpy as np
 
-from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, agglomerate, cut, finish_grouping, \
-    fused_similarity, gate_mask, same_photo_constraints
+from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, agglomerate, apply_cluster_merges, cut, finish_grouping, \
+    fused_similarity, gate_mask, merge_clusters, same_photo_constraints
 from .photos import RunData
 
 FMR_TARGETS = (1e-2, 1e-3, 1e-4)
@@ -210,79 +210,133 @@ def compare_models(run: RunData, models: list[str], labels: np.ndarray | None = 
 
 # ------------------------------------------------------------ grouping metrics
 
+REVIEW_BUDGETS = (0, 10, 25, 50, 100, 200)
+
+
+def _majorities(group_of_face: np.ndarray, labels: np.ndarray) -> tuple[dict[int, Counter], dict[int, str]]:
+    counters: dict[int, Counter] = defaultdict(Counter)
+    for row, group in enumerate(group_of_face):
+        if group != UNGROUPED and labels[row] is not None:
+            counters[int(group)][labels[row]] += 1
+    return counters, {group: counter.most_common(1)[0][0] for group, counter in counters.items()}
+
+
+def _people_counts(run: RunData, group_of_face: np.ndarray, labels: np.ndarray, photos: dict[int, str],
+                   focus: set[str], majority: dict[int, str], sizes: dict[int, int]) -> dict:
+    """Where each labelled photo of each person ended up. Ties for the main group go to the lower group id."""
+    photo_count = len(run.photos)
+    face_photo = np.asarray(run.face_photo, np.int64)
+    grouped = group_of_face != UNGROUPED
+    has_face = np.bincount(face_photo, minlength=photo_count) > 0
+    in_any = np.bincount(face_photo, weights=grouped, minlength=photo_count) > 0
+    photo_ids = np.fromiter(photos.keys(), np.int64, len(photos))
+    photo_people = np.asarray(list(photos.values()), dtype=object)
+    per_person = {}
+    for person in sorted(focus):
+        values, counts = np.unique(group_of_face[grouped & (labels == person)], return_counts=True)
+        main = int(values[np.argmax(counts)]) if len(values) else None
+        person_groups = [int(group) for group in values if majority.get(int(group)) == person]
+        in_main = np.bincount(face_photo, weights=group_of_face == main, minlength=photo_count) > 0 if main is not None \
+            else np.zeros(photo_count, bool)
+        in_own = np.bincount(face_photo, weights=np.isin(group_of_face, person_groups), minlength=photo_count) > 0
+        mine = photo_ids[photo_people == person]
+        no_face = ~has_face[mine]
+        found = ~no_face & in_main[mine]
+        other_own = ~no_face & ~found & in_own[mine]
+        others = ~no_face & ~found & ~other_own & in_any[mine]
+        counts_ = {"photos": int(len(mine)), "no_usable_face": int(no_face.sum()), "found_in_main_group": int(found.sum()),
+                   "in_other_group_of_person": int(other_own.sum()), "only_in_other_people_groups": int(others.sum())}
+        counts_["left_for_review"] = counts_["photos"] - sum(counts_[key] for key in counts_ if key != "photos")
+        total = counts_["photos"]
+        per_person[person] = {**counts_, "groups_led": len(person_groups), "main_group_size": sizes.get(main, 0) if main is not None else 0,
+                              "missing_rate": _ratio(total - counts_["found_in_main_group"], total)}
+    return per_person
+
+
+def _missing_summary(per_person: dict) -> dict:
+    total = sum(entry["photos"] for entry in per_person.values())
+    found = sum(entry["found_in_main_group"] for entry in per_person.values())
+    no_face = sum(entry["no_usable_face"] for entry in per_person.values())
+    return {"photos": total, "found_in_main_group": found, "missing_rate": _ratio(total - found, total), "no_usable_face": no_face,
+            "missing_rate_excluding_no_face": _ratio(total - no_face - found, total - no_face),
+            "left_for_review": sum(entry["left_for_review"] for entry in per_person.values()),
+            "in_other_group_of_person": sum(entry["in_other_group_of_person"] for entry in per_person.values()),
+            "only_in_other_people_groups": sum(entry["only_in_other_people_groups"] for entry in per_person.values())}
+
+
+def simulate_review(run: RunData, result: GroupingResult, labels: np.ndarray, photos: dict[int, str], focus: set[str],
+                    budgets: Iterable[int] = REVIEW_BUDGETS) -> list[dict]:
+    """A user who answers the first N merge suggestions correctly, using the answer key.
+
+    A suggestion counts as correct when both groups are led by the same person.
+    Rejected suggestions are wasted effort; accepted ones merge the groups.
+    Faces in the review list are not counted here.
+    """
+    _, majority = _majorities(result.labels, labels)
+    rows = []
+    for budget in budgets:
+        parent = {group: group for group in range(len(result.group_sizes))}
+
+        def find(group: int) -> int:
+            while parent[group] != group:
+                group = parent[group]
+            return group
+
+        accepted = rejected = 0
+        for item in result.suggestions[:budget]:
+            left, right = item["groups"]
+            if majority.get(left) is not None and majority.get(left) == majority.get(right):
+                a, b = find(left), find(right)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+                accepted += 1
+            else:
+                rejected += 1
+        merged = np.asarray([find(int(group)) if group != UNGROUPED else UNGROUPED for group in result.labels])
+        _, merged_majority = _majorities(merged, labels)
+        sizes = Counter(int(group) for group in merged if group != UNGROUPED)
+        summary = _missing_summary(_people_counts(run, merged, labels, photos, focus, merged_majority, sizes))
+        rows.append({"budget": budget, "suggestions_answered": min(budget, len(result.suggestions)), "accepted": accepted,
+                     "rejected": rejected, "photos": summary["photos"], "found_in_main_group": summary["found_in_main_group"],
+                     "missing_rate": summary["missing_rate"], "in_other_group_of_person": summary["in_other_group_of_person"]})
+    return rows
+
+
 def grouping_metrics(run: RunData, result: GroupingResult, labels: np.ndarray | None = None,
-                     people: Iterable[str] | None = None) -> dict:
+                     people: Iterable[str] | None = None, review: bool = False, photos: dict[int, str] | None = None) -> dict:
     """Mixing and missing for a grouping result. ``people`` limits the people evaluated."""
     labels = face_labels(run) if labels is None else labels
-    photos = photo_labels(run)
+    photos = photo_labels(run) if photos is None else photos
     focus = set(people) if people is not None else {label for label in photos.values()}
-    group_labels: dict[int, Counter] = defaultdict(Counter)
-    for row, group in enumerate(result.labels):
-        if group != UNGROUPED and labels[row] is not None:
-            group_labels[int(group)][labels[row]] += 1
-    majority = {group: counter.most_common(1)[0][0] for group, counter in group_labels.items()}
-    mixed_faces = grouped_labelled = 0
-    mixed_groups = 0
+    counters, majority = _majorities(result.labels, labels)
+    path_of = [face["photo"] for face in run.faces]
+    mixed_faces = grouped_labelled = mixed_groups = 0
     mixed_detail = []
-    for group, counter in group_labels.items():
+    for group, counter in counters.items():
         top = majority[group]
-        involved = {label for label in counter if label != top}
-        relevant = (top in focus) or bool(involved & focus)
-        if not relevant:
+        if top not in focus and not (set(counter) - {top}) & focus:
             continue
         intruders = sum(count for label, count in counter.items() if label != top and (label in focus or top in focus))
         grouped_labelled += sum(count for label, count in counter.items() if label in focus or top in focus)
         mixed_faces += intruders
         if intruders:
             mixed_groups += 1
+            rows = np.flatnonzero(result.labels == group)
             mixed_detail.append({"group": group, "size": result.group_sizes[group], "majority": top,
-                                 "intruders": {label: count for label, count in counter.items() if label != top}})
-    faces_by_photo: dict[int, list[int]] = defaultdict(list)
-    for row, photo in enumerate(run.face_photo):
-        faces_by_photo[int(photo)].append(row)
-    per_person = {}
-    for person in sorted(focus):
-        own_groups = Counter(int(group) for row, group in enumerate(result.labels) if group != UNGROUPED and labels[row] == person)
-        main = own_groups.most_common(1)[0][0] if own_groups else None
-        person_groups = {group for group in own_groups if majority.get(group) == person}
-        counts = Counter({key: 0 for key in ("photos", "no_usable_face", "found_in_main_group", "in_other_group_of_person",
-                                             "only_in_other_people_groups", "left_for_review")})
-        for photo_index, label in photos.items():
-            if label != person:
-                continue
-            counts["photos"] += 1
-            rows = faces_by_photo.get(photo_index, [])
-            groups = {int(result.labels[row]) for row in rows if result.labels[row] != UNGROUPED}
-            review = any(result.labels[row] == UNGROUPED for row in rows)
-            if not rows:
-                counts["no_usable_face"] += 1
-            elif main is not None and main in groups:
-                counts["found_in_main_group"] += 1
-            elif groups & person_groups:
-                counts["in_other_group_of_person"] += 1
-            elif groups:
-                counts["only_in_other_people_groups"] += 1
-            elif review:
-                counts["left_for_review"] += 1
-        total = counts["photos"]
-        per_person[person] = {**counts, "groups_led": len(person_groups),
-                              "main_group_size": result.group_sizes[main] if main is not None else 0,
-                              "missing_rate": _ratio(total - counts["found_in_main_group"], total),
-                              "missing_rate_excluding_no_face": _ratio(total - counts["no_usable_face"] - counts["found_in_main_group"],
-                                                                        total - counts["no_usable_face"])}
-    total_photos = sum(entry["photos"] for entry in per_person.values())
-    found = sum(entry["found_in_main_group"] for entry in per_person.values())
-    no_face = sum(entry["no_usable_face"] for entry in per_person.values())
-    return {"groups": len(result.group_sizes), "grouped_faces": int(np.sum(result.labels != UNGROUPED)),
-            "attached_faces": int(result.attached.sum()), "review_faces": len(result.review),
-            "mixing": {"mixed_faces": mixed_faces, "grouped_labelled_faces": grouped_labelled,
-                       "mixing_rate": _ratio(mixed_faces, grouped_labelled), "mixed_groups": mixed_groups,
-                       "details": sorted(mixed_detail, key=lambda item: -sum(item["intruders"].values()))[:20]},
-            "missing": {"photos": total_photos, "found_in_main_group": found, "missing_rate": _ratio(total_photos - found, total_photos),
-                        "no_usable_face": no_face,
-                        "missing_rate_excluding_no_face": _ratio(total_photos - no_face - found, total_photos - no_face),
-                        "mean_person_missing_rate": _mean([entry["missing_rate"] for entry in per_person.values()])},
-            "people": per_person}
+                                 "intruders": {label: count for label, count in counter.items() if label != top},
+                                 "intruder_photos": sorted(path_of[row] for row in rows if labels[row] is not None and labels[row] != top)[:50]})
+    sizes = {group: size for group, size in enumerate(result.group_sizes)}
+    per_person = _people_counts(run, result.labels, labels, photos, focus, majority, sizes)
+    metrics = {"groups": len(result.group_sizes), "grouped_faces": int(np.sum(result.labels != UNGROUPED)),
+               "attached_faces": int(result.attached.sum()), "review_faces": len(result.review), "merge_suggestions": len(result.suggestions),
+               "mixing": {"mixed_faces": mixed_faces, "grouped_labelled_faces": grouped_labelled,
+                          "mixing_rate": _ratio(mixed_faces, grouped_labelled), "mixed_groups": mixed_groups,
+                          "details": sorted(mixed_detail, key=lambda item: -sum(item["intruders"].values()))[:20]},
+               "missing": {**_missing_summary(per_person), "mean_person_missing_rate": _mean([entry["missing_rate"] for entry in per_person.values()])},
+               "people": per_person}
+    if review and result.suggestions:
+        metrics["review_simulation"] = simulate_review(run, result, labels, photos, focus)
+    return metrics
 
 
 def _ratio(numerator: float, denominator: float) -> float | None:
@@ -304,100 +358,205 @@ def _subset(run: RunData, rows: np.ndarray) -> RunData:
                    {name: matrix[rows] for name, matrix in run.embeddings.items()}, run.keys, run.report)
 
 
-class _Grid:
-    """Clusters every gate setting once, then cuts the merge tree at each threshold."""
+@dataclass(frozen=True)
+class SearchGrid:
+    """Candidate settings. None in cluster or attach values means the step is off."""
+    merge: tuple[float, ...]
+    attach: tuple[float | None, ...] = (None,)
+    eye: tuple[float, ...] = (0.0,)
+    cluster: tuple[float | None, ...] = (None,)
 
-    def __init__(self, run: RunData, base: GroupingPolicy) -> None:
-        self.run, self.base = run, base
+    @property
+    def merge_floor(self) -> float:
+        return min(self.merge)
+
+    @property
+    def cluster_floor(self) -> float | None:
+        values = [value for value in self.cluster if value is not None]
+        return min(values) if values else None
+
+
+class _Grid:
+    """Caches each clustering step so that every grid setting is cheap to evaluate."""
+
+    def __init__(self, run: RunData, base: GroupingPolicy, grid: SearchGrid) -> None:
+        self.run, self.base, self.grid = run, base, grid
         self.similarity = fused_similarity(run.embeddings, base)
         self.constraints = same_photo_constraints(run.face_photo)
         self.trees: dict[float, tuple[np.ndarray, list]] = {}
+        self.cluster_trees: dict[tuple[float, float], tuple[np.ndarray, list]] = {}
+        self.cuts: dict[tuple[float, float], np.ndarray] = {}
+        self.attach_scores: dict[tuple, dict] = {}
+        self._block_eye: float | None = None
+        self._block: tuple[np.ndarray, np.ndarray] | None = None
 
-    def results(self, min_eye: float, merge_values: Iterable[float], attach_values: Iterable[float | None]):
-        policy = replace(self.base, min_eye_distance=min_eye)
-        if min_eye not in self.trees:
-            rows = np.flatnonzero(gate_mask(self.run.faces, policy))
-            floor = min(merge_values)
-            merges = agglomerate(self.similarity[np.ix_(rows, rows)], self.constraints[np.ix_(rows, rows)], policy.linkage, floor)
-            self.trees[min_eye] = (rows, merges)
-        rows, merges = self.trees[min_eye]
-        for merge in merge_values:
-            local = cut(merges, len(rows), merge)
-            for attach in attach_values:
-                candidate = replace(policy, merge_threshold=merge, attach_threshold=attach)
-                yield candidate, finish_grouping(self.run, candidate, self.similarity, self.constraints, rows, local)
+    def _rows(self, eye: float) -> tuple[np.ndarray, list]:
+        if eye not in self.trees:
+            rows = np.flatnonzero(gate_mask(self.run.faces, replace(self.base, min_eye_distance=eye)))
+            merges = agglomerate(self.similarity[np.ix_(rows, rows)], self.constraints[np.ix_(rows, rows)], self.base.linkage, self.grid.merge_floor)
+            self.trees[eye] = (rows, merges)
+        return self.trees[eye]
+
+    def _blocks(self, eye: float) -> tuple[np.ndarray, np.ndarray]:
+        if self._block_eye != eye:  # keep one gated copy at a time; the grid loops over eye first
+            rows, _ = self._rows(eye)
+            self._block = (self.similarity[np.ix_(rows, rows)], self.constraints[np.ix_(rows, rows)])
+            self._block_eye = eye
+        return self._block
+
+    def local_labels(self, eye: float, merge: float, cluster: float | None) -> tuple[np.ndarray, np.ndarray]:
+        rows, merges = self._rows(eye)
+        if (eye, merge) not in self.cuts:
+            self.cuts[(eye, merge)] = cut(merges, len(rows), merge)
+        local = self.cuts[(eye, merge)]
+        if cluster is None:
+            return rows, local
+        key = (eye, merge)
+        if key not in self.cluster_trees:
+            similarity, constraints = self._blocks(eye)
+            self.cluster_trees[key] = merge_clusters(similarity, constraints, local, self.base.cluster_min_size, self.grid.cluster_floor)
+        cluster_of, cluster_merges = self.cluster_trees[key]
+        return rows, apply_cluster_merges(cluster_of, cluster_merges, cluster)
+
+    def result(self, policy: GroupingPolicy, suggestions: bool = True) -> GroupingResult:
+        rows, local = self.local_labels(policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold)
+        if not suggestions:
+            policy = replace(policy, suggest_threshold=None)
+        key = (policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold)
+        if key not in self.attach_scores:
+            self.attach_scores = {key: {}}  # the grid loops over attach last, so one entry is enough
+        return finish_grouping(self.run, policy, self.similarity, self.constraints, rows, local, self.attach_scores[key],
+                               review_candidates=suggestions)
+
+    def policies(self):
+        for eye in self.grid.eye:
+            for merge in self.grid.merge:
+                for cluster in self.grid.cluster:
+                    for attach in self.grid.attach:
+                        yield replace(self.base, min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
+                                      attach_threshold=attach)
 
 
-def _score(metrics: dict) -> tuple[float, float]:
+def _rates(metrics: dict) -> tuple[float, float]:
     mixing, missing = metrics["mixing"]["mixing_rate"], metrics["missing"]["missing_rate"]
     return (0.0 if mixing is None else mixing, 1.0 if missing is None else missing)
 
 
-def choose_policy(run: RunData, base: GroupingPolicy, merge_values, attach_values, eye_values,
-                  max_mixing_rate: float, labels: np.ndarray | None = None) -> tuple[GroupingPolicy | None, dict | None, list[dict]]:
-    """The policy with the fewest missing photos among those within the mixing limit."""
+def _conservative(policy: GroupingPolicy) -> tuple:
+    """Tie-breaker: prefer the stricter setting."""
+    return (-policy.merge_threshold, -(policy.cluster_merge_threshold if policy.cluster_merge_threshold is not None else math.inf),
+            -(policy.attach_threshold if policy.attach_threshold is not None else math.inf), -policy.min_eye_distance)
+
+
+def evaluate_grid(run: RunData, base: GroupingPolicy, grid: SearchGrid, labels: np.ndarray | None = None) -> list[tuple[GroupingPolicy, dict]]:
     labels = face_labels(run) if labels is None else labels
-    grid = _Grid(run, base)
-    best, best_metrics, best_rank, table = None, None, None, []
-    for eye in eye_values:
-        for policy, result in grid.results(eye, merge_values, attach_values):
-            metrics = grouping_metrics(run, result, labels)
-            mixing, missing = _score(metrics)
-            table.append({"min_eye_distance": eye, "merge_threshold": policy.merge_threshold, "attach_threshold": policy.attach_threshold,
-                          "mixing_rate": mixing, "mixed_groups": metrics["mixing"]["mixed_groups"], "missing_rate": missing,
-                          "groups": metrics["groups"]})
-            if mixing <= max_mixing_rate:
-                rank = (missing, mixing, -policy.merge_threshold, -(policy.attach_threshold or math.inf))
-                if best_metrics is None or rank < best_rank:
-                    best, best_metrics, best_rank = policy, metrics, rank
-    return best, best_metrics, table
+    photos = photo_labels(run)
+    cache = _Grid(run, base, grid)
+    return [(policy, grouping_metrics(run, cache.result(policy, suggestions=False), labels, photos=photos)) for policy in cache.policies()]
 
 
-def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, merge_values, attach_values, eye_values,
-                                   max_mixing_rate: float) -> dict:
-    """Choose thresholds without each person in turn, then measure errors that involve that person."""
+def pick(table: list[tuple[GroupingPolicy, dict]], max_mixing_rate: float) -> tuple[GroupingPolicy | None, dict | None]:
+    """Fewest missing photos among settings within the mixing limit; ties go to the stricter setting."""
+    allowed = [(policy, metrics) for policy, metrics in table if _rates(metrics)[0] <= max_mixing_rate]
+    if not allowed:
+        return None, None
+    return min(allowed, key=lambda item: (_rates(item[1])[1], _rates(item[1])[0], _conservative(item[0])))
+
+
+def choose_policy(run: RunData, base: GroupingPolicy, grid: SearchGrid, max_mixing_rate: float,
+                  labels: np.ndarray | None = None) -> tuple[GroupingPolicy | None, dict | None, list[dict]]:
+    table = evaluate_grid(run, base, grid, labels)
+    policy, metrics = pick(table, max_mixing_rate)
+    return policy, metrics, [table_row(policy_, metrics_) for policy_, metrics_ in table]
+
+
+def table_row(policy: GroupingPolicy, metrics: dict) -> dict:
+    mixing, missing = _rates(metrics)
+    return {"min_eye_distance": policy.min_eye_distance, "merge_threshold": policy.merge_threshold,
+            "cluster_merge_threshold": policy.cluster_merge_threshold, "attach_threshold": policy.attach_threshold,
+            "mixing_rate": mixing, "mixed_groups": metrics["mixing"]["mixed_groups"], "missing_rate": missing, "groups": metrics["groups"]}
+
+
+def _setting(policy: GroupingPolicy) -> dict:
+    return {"min_eye_distance": policy.min_eye_distance, "merge_threshold": policy.merge_threshold,
+            "cluster_merge_threshold": policy.cluster_merge_threshold, "attach_threshold": policy.attach_threshold}
+
+
+def _fold_base(run: RunData, base: GroupingPolicy) -> GroupingPolicy:
+    """Score normalization for fused models comes only from the people used for choosing."""
+    if len(base.models) < 2:
+        return base
+    offsets, scales = impostor_normalization(run, base.models)
+    return replace(base, offsets=offsets, scales=scales)
+
+
+_HELD_OUT_COUNTS = ("photos", "found_in_main_group", "no_usable_face", "left_for_review", "in_other_group_of_person",
+                    "only_in_other_people_groups")
+
+
+def _review_totals(rows: list[dict]) -> list[dict]:
+    """Sum the review simulation of several folds, budget by budget."""
+    by_budget: dict[int, Counter] = defaultdict(Counter)
+    for row in rows:
+        for key in ("suggestions_answered", "accepted", "rejected", "photos", "found_in_main_group"):
+            by_budget[row["budget"]][key] += row[key]
+    return [{"budget": budget, **counts, "missing_rate": _ratio(counts["photos"] - counts["found_in_main_group"], counts["photos"])}
+            for budget, counts in sorted(by_budget.items())]
+
+
+def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: SearchGrid, max_mixing_rates: Iterable[float]) -> dict:
+    """Choose settings without each person in turn, then measure errors that involve that person.
+
+    Every mixing limit in ``max_mixing_rates`` is evaluated from the same grid,
+    so the trade-off between mixing and missing is visible. The held-out
+    person's photos are grouped together with everyone else's, as in real use.
+    """
     labels = face_labels(run)
     photos = photo_labels(run)
     people = sorted(set(photos.values()))
-    folds = []
-    totals = Counter()
+    targets = sorted(set(max_mixing_rates))
+    full_cache: dict[tuple, _Grid] = {}
+    folds: dict[float, list[dict]] = {target: [] for target in targets}
     for person in people:
         train_rows = np.flatnonzero(np.asarray([photos.get(int(index)) != person for index in run.face_photo]))
         train = _subset(run, train_rows)
-        policy, train_metrics, _ = choose_policy(train, base, merge_values, attach_values, eye_values, max_mixing_rate)
-        if policy is None:
-            folds.append({"held_out": person, "policy": None, "note": "No setting met the mixing limit on the other people."})
-            continue
-        test = grouping_metrics(run, _group(run, policy), labels, people=[person])
-        entry = test["people"][person]
-        folds.append({"held_out": person, "policy": {"min_eye_distance": policy.min_eye_distance, "merge_threshold": policy.merge_threshold,
-                                                      "attach_threshold": policy.attach_threshold},
-                      "train_mixing_rate": train_metrics["mixing"]["mixing_rate"], "train_missing_rate": train_metrics["missing"]["missing_rate"],
-                      "held_out_mixed_faces": test["mixing"]["mixed_faces"], "held_out_grouped_labelled_faces": test["mixing"]["grouped_labelled_faces"],
-                      "held_out_mixed_groups": test["mixing"]["mixed_groups"], "held_out_mixing_details": test["mixing"]["details"],
-                      "held_out_person": entry})
-        totals["mixed_faces"] += test["mixing"]["mixed_faces"]
-        totals["grouped_labelled_faces"] += test["mixing"]["grouped_labelled_faces"]
-        totals["photos"] += entry["photos"]
-        totals["found"] += entry["found_in_main_group"]
-        totals["no_face"] += entry["no_usable_face"]
-        totals["review"] += entry.get("left_for_review", 0)
-        totals["other_group_of_person"] += entry.get("in_other_group_of_person", 0)
-        totals["only_in_other_people_groups"] += entry.get("only_in_other_people_groups", 0)
-    return {"method": "leave-one-person-out: thresholds chosen on the other people; errors counted only where the held-out person is involved",
-            "max_mixing_rate": max_mixing_rate, "folds": folds,
-            "held_out": {"mixed_faces": totals["mixed_faces"], "grouped_labelled_faces": totals["grouped_labelled_faces"],
-                         "mixing_rate": _ratio(totals["mixed_faces"], totals["grouped_labelled_faces"]),
-                         "photos": totals["photos"], "found_in_main_group": totals["found"],
-                         "missing_rate": _ratio(totals["photos"] - totals["found"], totals["photos"]),
-                         "no_usable_face": totals["no_face"], "left_for_review": totals["review"],
-                         "in_other_group_of_person": totals["other_group_of_person"],
-                         "only_in_other_people_groups": totals["only_in_other_people_groups"]}}
-
-
-def _group(run: RunData, policy: GroupingPolicy) -> GroupingResult:
-    from .photo_grouping import group_faces
-    return group_faces(run, policy)
+        fold_base = _fold_base(train, base)
+        table = evaluate_grid(train, fold_base, grid)
+        key = (fold_base.offsets, fold_base.scales)
+        if key not in full_cache:
+            full_cache[key] = _Grid(run, fold_base, grid)
+        for target in targets:
+            policy, train_metrics = pick(table, target)
+            if policy is None:
+                folds[target].append({"held_out": person, "policy": None, "note": "No setting met the mixing limit on the other people."})
+                continue
+            test = grouping_metrics(run, full_cache[key].result(policy), labels, people=[person], review=True)
+            folds[target].append({"held_out": person, "policy": _setting(policy),
+                                  "train_mixing_rate": train_metrics["mixing"]["mixing_rate"],
+                                  "train_missing_rate": train_metrics["missing"]["missing_rate"],
+                                  "mixed_faces": test["mixing"]["mixed_faces"],
+                                  "grouped_labelled_faces": test["mixing"]["grouped_labelled_faces"],
+                                  "mixed_groups": test["mixing"]["mixed_groups"], "mixing_details": test["mixing"]["details"],
+                                  "person": test["people"][person], "merge_suggestions": test["merge_suggestions"],
+                                  "review_simulation": test.get("review_simulation") or []})
+    results = {}
+    for target in targets:
+        measured = [fold for fold in folds[target] if fold["policy"] is not None]
+        totals = Counter()
+        for fold in measured:
+            totals["mixed_faces"] += fold["mixed_faces"]
+            totals["grouped_labelled_faces"] += fold["grouped_labelled_faces"]
+            for name in _HELD_OUT_COUNTS:
+                totals[name] += fold["person"][name]
+        held_out = {"mixed_faces": totals["mixed_faces"], "grouped_labelled_faces": totals["grouped_labelled_faces"],
+                    "mixing_rate": _ratio(totals["mixed_faces"], totals["grouped_labelled_faces"]),
+                    **{name: totals[name] for name in _HELD_OUT_COUNTS},
+                    "missing_rate": _ratio(totals["photos"] - totals["found_in_main_group"], totals["photos"]),
+                    "folds_without_setting": len(folds[target]) - len(measured),
+                    "after_review": _review_totals([row for fold in measured for row in fold["review_simulation"]])}
+        results[str(target)] = {"folds": folds[target], "held_out": held_out}
+    return {"method": "leave-one-person-out: settings chosen on the other people; errors counted only where the held-out person is involved",
+            "targets": results}
 
 
 def impostor_normalization(run: RunData, models: Iterable[str], labels: np.ndarray | None = None) -> tuple[tuple[float, ...], tuple[float, ...]]:
@@ -414,6 +573,26 @@ def impostor_normalization(run: RunData, models: Iterable[str], labels: np.ndarr
         offsets.append(float(scores.mean()))
         scales.append(float(scores.std()) or 1.0)
     return tuple(offsets), tuple(scales)
+
+
+def add_fused_embedding(run: RunData, models: list[str]) -> str:
+    """Add a combined embedding whose dot product ranks pairs like the fused grouping score.
+
+    Each model's unit vector is scaled by the square root of a weight
+    proportional to 1 / (spread of its different-person scores), and the
+    parts are joined. The dot product is then a weighted mean of cosines,
+    which orders pairs exactly like ``fused_similarity`` with equal weights,
+    so AUC and TAR at a false-match rate match; thresholds do not. The spread
+    is measured on all labelled people, which flatters the result a little.
+    """
+    name = ",".join(models)
+    _, scales = impostor_normalization(run, models)
+    weights = np.asarray([1.0 / scale for scale in scales])
+    weights /= weights.sum()
+    run.embeddings[name] = np.concatenate([run.embeddings[model] * np.float32(math.sqrt(weight))
+                                           for model, weight in zip(models, weights)], axis=1).astype(np.float32)
+    run.keys[name] = "fused(" + ";".join(f"{run.keys.get(model)}*{weight:.4f}" for model, weight in zip(models, weights)) + ")"
+    return name
 
 
 # ------------------------------------------------- known-people identification

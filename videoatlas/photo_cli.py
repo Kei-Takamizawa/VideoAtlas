@@ -29,8 +29,8 @@ def _grid(value: str) -> list[float]:
     return [float(item) for item in value.split(",") if item.strip()]
 
 
-def _attach_grid(value: str) -> list[float | None]:
-    """Like a grid; the item "none" means no attach step."""
+def _optional_grid(value: str) -> list[float | None]:
+    """Like a grid; the item "none" means the step is off."""
     items = [item.strip() for item in value.split(",") if item.strip()]
     keep_none = any(item.lower() == "none" for item in items)
     rest = ",".join(item for item in items if item.lower() != "none")
@@ -92,10 +92,13 @@ class _ProviderView:
 
 
 def cmd_verify(args) -> int:
-    from .photo_evaluation import compare_models, verification_report
+    from .photo_evaluation import add_fused_embedding, compare_models, verification_report
     from .photos import load_run
-    run = load_run(args.run, args.models)
-    names = args.models or sorted(run.embeddings)
+    fused = args.fuse or []
+    needed = None if args.models is None else sorted(set(args.models) | {model for group in fused for model in group})
+    run = load_run(args.run, needed)
+    names = list(args.models or sorted(run.embeddings))
+    names += [add_fused_embedding(run, group) for group in fused]
     result = {"run": str(args.run), "models": {name: verification_report(run, name) for name in names},
               "comparison": compare_models(run, names, repetitions=args.bootstrap, seed=args.seed),
               "notes": ["Single-face pairs from labelled photos whose file is not filed under two people.",
@@ -107,7 +110,7 @@ def cmd_verify(args) -> int:
     return 0
 
 
-def _base_policy(args, run) -> "GroupingPolicy":
+def _base_policy(args, run):
     from .photo_evaluation import impostor_normalization
     from .photo_grouping import GroupingPolicy
     offsets = scales = None
@@ -115,30 +118,50 @@ def _base_policy(args, run) -> "GroupingPolicy":
         offsets, scales = impostor_normalization(run, args.models)
     return GroupingPolicy(tuple(args.models), merge_threshold=0.0, attach_threshold=None, attach_margin=args.attach_margin,
                           attach_top_k=args.top_k, min_group_size=args.min_group_size, linkage=args.linkage,
-                          offsets=offsets, scales=scales)
+                          cluster_min_size=args.cluster_min_size, suggest_threshold=args.suggest_threshold,
+                          max_suggestions=args.max_suggestions, offsets=offsets, scales=scales)
+
+
+def _brief(metrics: dict | None) -> dict | None:
+    if metrics is None:
+        return None
+    return {**{key: metrics[key] for key in ("groups", "grouped_faces", "attached_faces", "review_faces", "merge_suggestions")},
+            "mixing": {key: value for key, value in metrics["mixing"].items() if key != "details"},
+            "missing": metrics["missing"], "people": metrics["people"]}
 
 
 def cmd_calibrate(args) -> int:
-    from .photo_evaluation import calibrate_leave_one_person_out, choose_policy
+    from .photo_evaluation import SearchGrid, calibrate_leave_one_person_out, evaluate_grid, pick, table_row
     from .photos import load_run
     run = load_run(args.run, args.models)
     base = _base_policy(args, run)
+    grid = SearchGrid(tuple(args.merge_grid), tuple(args.attach_grid), tuple(args.eye_grid), tuple(args.cluster_grid))
+    targets = sorted(set(args.targets) | {args.policy_target})
     started = time.monotonic()
-    held_out = calibrate_leave_one_person_out(run, base, args.merge_grid, args.attach_grid, args.eye_grid, args.max_mixing)
-    policy, metrics, table = choose_policy(run, base, args.merge_grid, args.attach_grid, args.eye_grid, args.max_mixing)
-    result = {"run": str(args.run), "models": args.models, "max_mixing_rate": args.max_mixing,
-              "grid": {"merge": args.merge_grid, "attach": args.attach_grid, "min_eye_distance": args.eye_grid},
+    held_out = calibrate_leave_one_person_out(run, base, grid, targets)
+    table = evaluate_grid(run, base, grid)
+    all_people = {}
+    for target in targets:
+        policy, metrics = pick(table, target)
+        all_people[str(target)] = {"policy": policy.to_json() if policy else None, "metrics": _brief(metrics)}
+    result = {"run": str(args.run), "models": args.models, "policy_target": args.policy_target,
+              "grid": {"merge": grid.merge, "attach": grid.attach, "min_eye_distance": grid.eye, "cluster_merge": grid.cluster,
+                       "settings": len(table)},
               "held_out": held_out,
-              "all_people": {"policy": policy.to_json() if policy else None, "metrics": metrics,
+              "all_people": {"targets": all_people,
                              "note": "Chosen and measured on the same people: optimistic. Use the held_out numbers as the estimate."},
-              "table": table, "elapsed_seconds": round(time.monotonic() - started, 1)}
+              "table": [table_row(policy, metrics) for policy, metrics in table],
+              "elapsed_seconds": round(time.monotonic() - started, 1)}
+    policy, _ = pick(table, args.policy_target)
     if policy is not None and args.policy_output:
         calibrated = replace(policy, review_threshold=args.review_threshold,
-                             calibration={"run": str(args.run), "max_mixing_rate": args.max_mixing,
-                                          "held_out": held_out["held_out"]})
+                             calibration={"run": str(args.run), "max_mixing_rate": args.policy_target,
+                                          "held_out": held_out["targets"][str(args.policy_target)]["held_out"]})
         _write_json(args.policy_output, calibrated.to_json())
     _write_json(args.output, result)
-    print(json.dumps({"held_out": held_out["held_out"], "policy": result["all_people"]["policy"]}, indent=2, default=_json_default))
+    digest = {target: {key: entry["held_out"][key] for key in ("mixing_rate", "missing_rate", "folds_without_setting")}
+              for target, entry in held_out["targets"].items()}
+    print(json.dumps({"held_out": digest, "policy": policy.to_json() if policy else None}, indent=2, default=_json_default))
     return 0
 
 
@@ -188,26 +211,35 @@ def add_photo_commands(commands, common) -> None:
     verify.add_argument("run", type=Path)
     verify.add_argument("--models", type=_models)
     verify.add_argument("--output", type=Path, required=True)
+    verify.add_argument("--fuse", type=_models, action="append",
+                        help="also measure the fused score of these comma-separated models (repeatable)")
     verify.add_argument("--bootstrap", type=int, default=1000)
     verify.add_argument("--seed", type=int, default=0)
     verify.set_defaults(handler=cmd_verify)
 
-    for name, handler, helptext in (("calibrate", cmd_calibrate, "choose thresholds with leave-one-person-out evaluation"),):
-        calibrate = actions.add_parser(name, help=helptext)
-        calibrate.add_argument("run", type=Path)
-        calibrate.add_argument("--models", type=_models, required=True)
-        calibrate.add_argument("--output", type=Path, required=True)
-        calibrate.add_argument("--policy-output", type=Path, help="write the policy chosen on all people here")
-        calibrate.add_argument("--max-mixing", type=float, default=0.002, help="highest allowed share of mixed faces on the people used for choosing")
-        calibrate.add_argument("--merge-grid", type=_grid, default=_grid("0.20:0.70:0.025"))
-        calibrate.add_argument("--attach-grid", type=_attach_grid, default=_grid("0.25:0.80:0.05"))
-        calibrate.add_argument("--eye-grid", type=_grid, default=[0.0, 12.0, 16.0, 20.0, 25.0])
-        calibrate.add_argument("--attach-margin", type=float, default=0.05)
-        calibrate.add_argument("--top-k", type=int, default=5)
-        calibrate.add_argument("--min-group-size", type=int, default=2)
-        calibrate.add_argument("--linkage", choices=("average", "complete"), default="average")
-        calibrate.add_argument("--review-threshold", type=float, help="lowest score at which a group is suggested for a review face")
-        calibrate.set_defaults(handler=handler)
+    calibrate = actions.add_parser("calibrate", help="choose thresholds with leave-one-person-out evaluation")
+    calibrate.add_argument("run", type=Path)
+    calibrate.add_argument("--models", type=_models, required=True)
+    calibrate.add_argument("--output", type=Path, required=True)
+    calibrate.add_argument("--policy-output", type=Path, help="write the policy chosen on all people here")
+    calibrate.add_argument("--targets", type=_grid, default=[0.0, 0.0005, 0.001, 0.002, 0.005, 0.01],
+                           help="mixing limits to evaluate; each gives one held-out estimate")
+    calibrate.add_argument("--policy-target", type=float, default=0.002, help="mixing limit for the written policy")
+    calibrate.add_argument("--merge-grid", type=_grid, default=_grid("0.20:0.70:0.025"))
+    calibrate.add_argument("--attach-grid", type=_optional_grid, default=[None, *_grid("0.25:0.60:0.05")])
+    calibrate.add_argument("--eye-grid", type=_grid, default=[0.0, 16.0])
+    calibrate.add_argument("--cluster-grid", type=_optional_grid, default=[None],
+                           help="cluster merge thresholds (normalized score); none turns the step off")
+    calibrate.add_argument("--cluster-min-size", type=int, default=3)
+    calibrate.add_argument("--attach-margin", type=float, default=0.05)
+    calibrate.add_argument("--top-k", type=int, default=5)
+    calibrate.add_argument("--min-group-size", type=int, default=2)
+    calibrate.add_argument("--linkage", choices=("average", "complete"), default="average")
+    calibrate.add_argument("--suggest-threshold", type=float,
+                           help="lowest normalized score at which two groups are suggested as one person")
+    calibrate.add_argument("--max-suggestions", type=int, default=200)
+    calibrate.add_argument("--review-threshold", type=float, help="lowest score at which a group is suggested for a review face")
+    calibrate.set_defaults(handler=cmd_calibrate)
 
     identify = actions.add_parser("identify", help="measure matching against a few named example photos per person")
     identify.add_argument("run", type=Path)

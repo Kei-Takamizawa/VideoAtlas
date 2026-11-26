@@ -90,18 +90,19 @@ The `photos` commands group still photos by person and measure the result agains
 ```bash
 .venv/bin/python Scripts/provision_photo_models.py --models w600k-r50,glintr100,lvface-b
 .venv/bin/python -m videoatlas.cli photos analyze PHOTO_FOLDER --output RUN --models face01,w600k-r50
-.venv/bin/python -m videoatlas.cli photos verify RUN --output RUN/verify.json
-.venv/bin/python -m videoatlas.cli photos calibrate RUN --models w600k-r50 --output RUN/calibration.json --policy-output RUN/policy.json
+.venv/bin/python -m videoatlas.cli photos verify RUN --output RUN/verify.json --fuse glintr100,lvface-b
+.venv/bin/python -m videoatlas.cli photos calibrate RUN --models glintr100 --cluster-grid none,0.6,0.7 --suggest-threshold 0.3 \
+  --output RUN/calibration.json --policy-output RUN/policy.json
 .venv/bin/python -m videoatlas.cli photos group RUN --policy RUN/policy.json --output RUN/groups.json
 ```
 
 - `analyze` detects every face without a size cut-off, records its eye distance and pose, and embeds each usable face with every listed model. It writes `faces.jsonl`, `embeddings/<model>.npz`, and `report.json`. Each model keeps its own embedding key (file hash, preprocessing, CPU/GPU profile).
-- `verify` compares models on single-face pairs: AUC, equal error rate, and true-match rate at fixed false-match rates, overall and by face size, with a paired bootstrap over people.
-- `calibrate` chooses the grouping thresholds. For each person in turn, it chooses thresholds on the other people only, then counts mixing and missing errors that involve the held-out person. It also writes the policy chosen on all people.
+- `verify` compares models on single-face pairs: AUC, equal error rate, and true-match rate at fixed false-match rates, overall and by face size, with a paired bootstrap over people. `--fuse a,b` also measures the fused score of several models.
+- `calibrate` chooses the grouping thresholds. For each person in turn, it chooses thresholds on the other people only, then counts mixing and missing errors that involve the held-out person. It does this for every mixing limit in `--targets`, so the trade-off between mixing and missing is visible, and simulates a user who answers the first N merge suggestions. It writes the policy chosen on all people for `--policy-target`.
 - `group` applies a policy file and writes the groups file that the browser GUI reads. `identify` measures the alternative of matching faces to a few named example photos per person.
 - `Scripts/evaluate_photo_grouping.sh` runs analyze, verify, and calibrate for several models on the GPU and writes a short `summary.txt`.
 
-The grouping policy is constrained average-linkage clustering. Faces in the same photo never share a group. A lone face joins a group only when the mean of its top-k similarities to the group passes a threshold and leads the next group by a margin; otherwise it is listed for review with suggested groups. All thresholds are uncalibrated until `calibrate` has run on representative labelled photos. The candidate recognition models have non-commercial licences.
+The grouping policy is constrained average-linkage clustering. Faces in the same photo never share a group. An optional second step merges two clusters of at least three faces when their mean cross similarity, divided by the geometric mean of their own mean internal similarities, passes a threshold; this joins one person's looks that the first step kept apart. A lone face joins a group only when the mean of its top-k similarities to the group passes a threshold and leads the next group by a margin; otherwise it is listed for review with suggested groups. Group pairs that may be one person are listed as merge suggestions; only the user's confirmation merges them. All thresholds are uncalibrated until `calibrate` has run on representative labelled photos. The candidate recognition models have non-commercial licences.
 
 ## Current implementation context
 
