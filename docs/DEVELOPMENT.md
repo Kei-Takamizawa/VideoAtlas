@@ -89,7 +89,7 @@ The `photos` commands group still photos by person and measure the result agains
 
 ```bash
 .venv/bin/python Scripts/provision_photo_models.py --models w600k-r50,glintr100,lvface-b
-.venv/bin/python -m videoatlas.cli photos analyze PHOTO_FOLDER --output RUN --models face01,w600k-r50
+.venv/bin/python -m videoatlas.cli photos analyze PHOTO_FOLDER --output RUN --models face01,glintr100,lvface-b
 .venv/bin/python -m videoatlas.cli photos verify RUN --output RUN/verify.json --fuse glintr100,lvface-b
 .venv/bin/python -m videoatlas.cli photos calibrate RUN --models glintr100 --cluster-grid none,0.6,0.7 --suggest-threshold 0.3 \
   --output RUN/calibration.json --policy-output RUN/policy.json
