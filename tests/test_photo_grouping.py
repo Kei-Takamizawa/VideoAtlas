@@ -446,3 +446,51 @@ def test_cluster_sums_match_brute_force():
             assert math.isclose(sums.cross[a, b], float(block.astype(np.float64).sum()), rel_tol=1e-5, abs_tol=1e-4)
     assert sums.blocked[list(sums.values).index(labels[2]), list(sums.values).index(labels[9])]
     assert np.allclose(sums.diagonal, [np.diag(similarity)[labels == value].sum() for value in sums.values], atol=1e-5)
+
+
+def reference_merge_clusters(similarity, constraints, labels, min_size, floor):
+    """Recompute every cluster pair score after each merge (slow, obviously correct)."""
+    from videoatlas.photo_grouping import ClusterSums
+    _, cluster_of, counts = np.unique(labels, return_inverse=True, return_counts=True)
+    big = np.flatnonzero(counts >= min_size)
+    items = np.flatnonzero(np.isin(cluster_of, big))
+    sums = ClusterSums(similarity[np.ix_(items, items)], constraints[np.ix_(items, items)], cluster_of[items])
+    count, active, merges = len(sums.values), np.ones(len(sums.values), bool), []
+    while count > 1:
+        scores = sums.scores(min_size)
+        scores[~active] = -math.inf
+        scores[:, ~active] = -math.inf
+        left, right = divmod(int(np.argmax(scores)), count)
+        if not scores[left, right] >= floor:
+            break
+        keep, drop = min(left, right), max(left, right)
+        merges.append((int(sums.values[keep]), int(sums.values[drop]), float(scores[left, right])))
+        sums.cross[keep] += sums.cross[drop]
+        sums.cross[:, keep] += sums.cross[:, drop]
+        sums.diagonal[keep] += sums.diagonal[drop]
+        sums.sizes[keep] += sums.sizes[drop]
+        sums.blocked[keep] |= sums.blocked[drop]
+        sums.blocked[:, keep] = sums.blocked[keep]
+        active[drop] = False
+        sums.sizes[drop] = 0
+        sums.cross[drop] = 0
+        sums.cross[:, drop] = 0
+    return merges
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_incremental_cluster_merge_matches_full_recompute(seed):
+    generator = np.random.default_rng(seed)
+    vectors = unit(generator.normal(size=(120, 16)) + np.repeat(generator.normal(size=(6, 16)) * 1.5, 20, axis=0))
+    similarity = (vectors @ vectors.T).astype(np.float32)
+    labels = generator.integers(0, 40, size=120)
+    blocked = np.zeros((120, 120), bool)
+    for a, b in generator.integers(0, 120, size=(15, 2)):
+        if a != b:
+            blocked[a, b] = blocked[b, a] = True
+    for min_size in (2, 3):
+        _, merges = merge_clusters(similarity, blocked, labels, min_size, -0.5)
+        expected = reference_merge_clusters(similarity, blocked, labels, min_size, -0.5)
+        assert [merge[:2] for merge in merges] == [merge[:2] for merge in expected]
+        assert np.allclose([merge[2] for merge in merges], [merge[2] for merge in expected], atol=1e-9)
+        assert len(merges) > 5

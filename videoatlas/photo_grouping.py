@@ -261,6 +261,9 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
     count = len(ids)
     active = np.ones(count, bool)
     scores = sums.scores(min_size)
+    sizes = sums.sizes
+    with np.errstate(divide="ignore", invalid="ignore"):
+        within = (np.diag(sums.cross) - sums.diagonal) / (sizes * (sizes - 1))
     while True:
         flat = int(np.argmax(scores))
         left, right = divmod(flat, count)
@@ -272,16 +275,26 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
         sums.cross[keep] += sums.cross[drop]
         sums.cross[:, keep] += sums.cross[:, drop]
         sums.diagonal[keep] += sums.diagonal[drop]
-        sums.sizes[keep] += sums.sizes[drop]
+        sizes[keep] += sizes[drop]
         sums.blocked[keep] |= sums.blocked[drop]
         sums.blocked[:, keep] = sums.blocked[keep]
         active[drop] = False
-        sums.sizes[drop] = 0
+        sizes[drop] = 0
         sums.cross[drop] = 0
         sums.cross[:, drop] = 0
-        scores = sums.scores(min_size)
-        scores[~active] = -math.inf
-        scores[:, ~active] = -math.inf
+        # Only the merged cluster's scores change; update its row and column.
+        within[keep] = (sums.cross[keep, keep] - sums.diagonal[keep]) / (sizes[keep] * (sizes[keep] - 1))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            row = sums.cross[keep] / (sizes[keep] * sizes) / np.sqrt(within[keep] * within)
+        allowed = active & (sizes >= min_size) & (within > 0) & ~sums.blocked[keep] & np.isfinite(row)
+        if not within[keep] > 0:
+            allowed[:] = False
+        row[~allowed] = -math.inf
+        row[keep] = -math.inf
+        scores[keep] = row
+        scores[:, keep] = row
+        scores[drop] = -math.inf
+        scores[:, drop] = -math.inf
     return cluster_of, merges
 
 
