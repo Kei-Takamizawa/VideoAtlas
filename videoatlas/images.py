@@ -55,7 +55,7 @@ def analyze_images(analyzer, paths: list[Path], root: Path, stop: Callable[[], b
         if stop is not None and stop():
             return
         result = ImageResult(Path(path), folder_label(path, root))
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        image = read_image(Path(path))
         if image is None:
             result.error = "unreadable_image"
         else:
@@ -69,22 +69,36 @@ def analyze_images(analyzer, paths: list[Path], root: Path, stop: Callable[[], b
         yield result
 
 
-def primary_face(result: ImageResult) -> FaceSample | None:
-    """Largest accepted face, assuming a labelled photo shows its subject largest."""
-    accepted = [face for face in result.faces if face.embedding is not None]
-    if not accepted:
+def read_image(path: Path) -> np.ndarray | None:
+    """Decode an image from bytes, so non-ASCII Windows paths also work."""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
         return None
-    return max(accepted, key=lambda face: face.bounding_box[2] * face.bounding_box[3])
+    return cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+
+
+def primary_face(result: ImageResult) -> FaceSample | None:
+    """The largest detected face, if it was accepted.
+
+    A labelled photo is assumed to show its subject as the largest face. When
+    that face is rejected, the image has no primary face; a smaller bystander
+    never inherits the folder label.
+    """
+    if not result.faces:
+        return None
+    largest = max(result.faces, key=lambda face: face.bounding_box[2] * face.bounding_box[3])
+    return largest if largest.embedding is not None else None
 
 
 def update_label_stats(stats: dict[str, dict], result: ImageResult) -> None:
     entry = stats.setdefault(result.label or "(unlabelled)", {
-        "images": 0, "unreadable": 0, "images_with_detection": 0, "images_with_accepted_face": 0,
+        "images": 0, "unreadable": 0, "images_with_detection": 0, "images_with_accepted_primary_face": 0,
         "faces_detected": 0, "faces_accepted": 0, "rejections": Counter()})
     entry["images"] += 1
     entry["unreadable"] += result.error is not None
     entry["images_with_detection"] += bool(result.faces)
-    entry["images_with_accepted_face"] += primary_face(result) is not None
+    entry["images_with_accepted_primary_face"] += primary_face(result) is not None
     entry["faces_detected"] += len(result.faces)
     entry["faces_accepted"] += sum(face.embedding is not None for face in result.faces)
     entry["rejections"].update(face.rejection_reason for face in result.faces if face.rejection_reason)
@@ -104,7 +118,7 @@ def _auc(positives: np.ndarray, negatives: np.ndarray) -> float | None:
     return float((below + (at_most - below) / 2).sum() / (positives.size * negatives.size))
 
 
-def pair_report(labels: list[str], vectors: np.ndarray, thresholds: Iterable[float] = DEFAULT_THRESHOLDS) -> dict:
+def pair_report(labels: list[str], vectors: np.ndarray, thresholds: Iterable[float] = DEFAULT_THRESHOLDS, block_size: int = 1024) -> dict:
     """Cosine scores for every pair of labelled images, one face per image.
 
     This is score-only evidence for single images. It is not the application's
@@ -113,7 +127,7 @@ def pair_report(labels: list[str], vectors: np.ndarray, thresholds: Iterable[flo
     vectors = np.asarray(vectors, np.float32)
     if vectors.ndim != 2 or vectors.shape[0] != len(labels):
         raise ValueError("vectors must have one row per label")
-    report = {"unit": "single-image face pairs (largest accepted face per labelled image)",
+    report = {"unit": "single-image face pairs (accepted largest face per labelled image)",
               "image_count": len(labels), "label_count": len(set(labels))}
     if len(labels) < 2:
         return {**report, "pair_count": 0, "positive_count": 0, "negative_count": 0,
@@ -123,10 +137,18 @@ def pair_report(labels: list[str], vectors: np.ndarray, thresholds: Iterable[flo
         raise ValueError("vectors must be finite and nonzero")
     vectors = vectors / norms
     _, codes = np.unique(np.asarray(labels), return_inverse=True)
-    upper = np.triu_indices(len(labels), k=1)
-    scores = (vectors @ vectors.T)[upper]
-    same = codes[upper[0]] == codes[upper[1]]
-    positives, negatives = np.sort(scores[same]), np.sort(scores[~same])
+    count = len(labels)
+    columns = np.arange(count)
+    positive_parts, negative_parts = [], []
+    # Row blocks keep peak memory near the score arrays instead of an N x N matrix.
+    for start in range(0, count, block_size):
+        stop = min(start + block_size, count)
+        scores = vectors[start:stop] @ vectors.T
+        later = columns[None, :] > np.arange(start, stop)[:, None]
+        same = codes[start:stop, None] == codes[None, :]
+        positive_parts.append(scores[later & same])
+        negative_parts.append(scores[later & ~same])
+    positives, negatives = np.sort(np.concatenate(positive_parts)), np.sort(np.concatenate(negative_parts))
     rows = []
     for threshold in thresholds:
         tp = int(positives.size - np.searchsorted(positives, threshold, side="left"))
@@ -136,10 +158,10 @@ def pair_report(labels: list[str], vectors: np.ndarray, thresholds: Iterable[flo
                      "precision": _ratio(tp, tp + fp), "recall": _ratio(tp, tp + fn),
                      "false_positive_rate": _ratio(fp, fp + tn)})
     max_negative = float(negatives[-1]) if negatives.size else None
-    clean = int(positives.size - np.searchsorted(positives, max_negative, side="right")) if max_negative is not None else int(positives.size)
-    return {**report, "pair_count": int(scores.size), "positive_count": int(positives.size), "negative_count": int(negatives.size),
+    clean = int(positives.size - np.searchsorted(positives, max_negative, side="right")) if max_negative is not None else None
+    return {**report, "pair_count": int(positives.size + negatives.size), "positive_count": int(positives.size), "negative_count": int(negatives.size),
             "auc": _auc(positives, negatives), "max_negative_score": max_negative,
-            "recall_with_zero_false_positives": _ratio(clean, int(positives.size)),
+            "recall_with_zero_false_positives": _ratio(clean, int(positives.size)) if clean is not None else None,
             "positive_score_quantiles": _quantiles(positives), "negative_score_quantiles": _quantiles(negatives),
             "thresholds": rows}
 

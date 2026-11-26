@@ -630,9 +630,9 @@ class MainWindow(QMainWindow):
         if self.acceleration_combo.currentData() == "cpu":
             policy = "CPU FP32."
         elif accurate:
-            policy = "Accurate: CUDA FP32 with TF32 disabled, then CPU. TensorRT requests use this fallback."
+            policy = "Accurate: CUDA FP32 with TF32 disabled. Auto falls back to CPU; CUDA and TensorRT requests stop if the GPU fails."
         else:
-            policy = "Balanced: TensorRT FP16, then CUDA with TF32 enabled, then CPU. CUDA requests skip TensorRT."
+            policy = "Balanced: TensorRT FP16, then CUDA with TF32 enabled. Auto falls back to CPU; CUDA and TensorRT requests stop if the GPU fails. CUDA requests skip TensorRT."
         self.policy_label.setText(tr(policy))
         self.runtime_label.setText(self.model.runtime_description or self.configuration_error or tr("The active runtime appears when analysis starts."))
 

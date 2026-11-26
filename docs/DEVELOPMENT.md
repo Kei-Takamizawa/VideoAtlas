@@ -77,9 +77,9 @@ Headless commands:
 .venv/bin/python -m videoatlas.cli images PHOTO_FOLDER --output RUN_FOLDER
 ```
 
-`doctor` loads the models and reports the ONNX Runtime providers that each model registered. `images` detects, aligns, and embeds every face in a photo folder, then writes `faces.jsonl`, `embeddings.npz`, and `report.json` to a new output folder. When the photo folder has one subfolder per person, the folder names serve only as an offline answer key for a single-image pair evaluation after inference.
+`doctor` loads the models and reports the ONNX Runtime providers that each model registered. `images` detects, aligns, and embeds every face in a photo folder, then writes `faces.jsonl`, `embeddings.npz`, and `report.json` to a new output folder, which must be outside the photo folder. When the photo folder has one subfolder per person, the folder names serve only as an offline answer key for a single-image pair evaluation after inference.
 
-GPU use is explicit. `--device cuda` is the default and stops with an error when any model cannot run on the GPU. `--device auto` permits a CPU fallback and logs a warning. `--device cpu` uses the CPU only. The same rule applies to the `acceleration` setting everywhere: `cuda` and `tensorrt` now fail instead of falling back to the CPU, and `auto` logs any fallback. TensorRT loading remains Windows-only.
+GPU use is explicit. `--device cuda` is the default and stops with an error when any model cannot run on the GPU. `--device auto` permits a CPU fallback and logs a warning. `--device cpu` uses the CPU only. The same rule applies to the `acceleration` setting everywhere: `cuda` and `tensorrt` now fail instead of falling back to the CPU, and `auto` logs any fallback. TensorRT loading remains Windows-only. The check covers which providers a session registered; ONNX Runtime may still place individual unsupported operators on the CPU inside a CUDA session.
 
 ## Current implementation context
 
