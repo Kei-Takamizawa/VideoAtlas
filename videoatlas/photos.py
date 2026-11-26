@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 
 from .embedders import OnnxEmbedder, blur_score
-from .images import folder_label, iter_image_files
+from .images import folder_label, iter_image_files, read_image
 
 RUN_FILES = ("faces.jsonl", "report.json")
 EMBEDDING_DIR = "embeddings"
@@ -157,6 +157,8 @@ def analyze_folder(analyzer: PhotoAnalyzer, root: Path, output: Path, paths: Ite
                    progress: Callable[[int, int], None] | None = None, extra_report: dict | None = None) -> dict:
     """Analyze every photo below root and write a run folder. Returns the report."""
     root, output = Path(root).resolve(), Path(output).resolve()
+    if output == root or output.is_relative_to(root):
+        raise ValueError(f"The output folder must be outside the photo folder {root}, or later runs would read its files as photos")
     existing = [name for name in RUN_FILES if (output / name).exists()]
     if existing:
         raise FileExistsError(f"Output already exists in {output}: {', '.join(existing)}. Choose a new output folder.")
@@ -165,6 +167,7 @@ def analyze_folder(analyzer: PhotoAnalyzer, root: Path, output: Path, paths: Ite
         raise ValueError(f"No images found below {root}")
     (output / EMBEDDING_DIR).mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    providers_at_start = analyzer.providers()
     ids = {name: [] for name in analyzer.names}
     rows = {name: [] for name in analyzer.names}
     stats: dict[str, Counter] = {}
@@ -173,7 +176,7 @@ def analyze_folder(analyzer: PhotoAnalyzer, root: Path, output: Path, paths: Ite
         for number, path in enumerate(paths, 1):
             relative = Path(path).resolve().relative_to(root).as_posix()
             result = PhotoResult(Path(path), relative, folder_label(Path(path).resolve(), root), sha256_file(path))
-            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            image = read_image(Path(path))
             if image is None:
                 result.error = "unreadable_image"
             else:
@@ -202,6 +205,10 @@ def analyze_folder(analyzer: PhotoAnalyzer, root: Path, output: Path, paths: Ite
             stream.write(json.dumps(result.record(), ensure_ascii=False) + "\n")
             if progress is not None:
                 progress(number, len(paths))
+    if analyzer.providers() != providers_at_start:
+        # A model switched to the CPU midway: its rows would mix two numerical profiles under one key.
+        raise RuntimeError(f"Execution providers changed during the run ({providers_at_start} -> {analyzer.providers()}). "
+                           "Rerun with --device cuda so that a GPU failure stops the run instead.")
     for name, embedder in zip(analyzer.names, analyzer.embedders):
         matrix = np.concatenate(rows[name]) if rows[name] else np.zeros((0, 0), np.float32)
         np.savez_compressed(output / EMBEDDING_DIR / f"{name}.npz", face_ids=np.asarray(ids[name]), vectors=matrix.astype(np.float32),

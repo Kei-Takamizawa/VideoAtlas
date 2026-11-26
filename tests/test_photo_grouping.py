@@ -294,6 +294,8 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
             assert cv2.imwrite(str(root / person / f"{index}.png"), image)
     (root / "A" / "broken.jpg").write_bytes(b"not an image")
     run_folder = tmp_path / "run"
+    with pytest.raises(ValueError):
+        analyze_folder(PhotoAnalyzer(FakeDetector(), [FakeEmbedder()]), root, root / "run")
     report = analyze_folder(PhotoAnalyzer(FakeDetector(), [FakeEmbedder()]), root, run_folder)
     assert report["image_count"] == 9 and report["labels"]["A"]["unreadable"] == 1
     with pytest.raises(FileExistsError):
