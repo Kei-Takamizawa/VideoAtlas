@@ -85,7 +85,7 @@ GPU use is explicit. `--device cuda` is the default and stops with an error when
 
 ### Photo grouping (experimental)
 
-The `photos` commands group still photos by person and measure the result against a folder-per-person answer key. They are separate from the video pipeline.
+The `photos` commands group still photos by person and measure the result against a folder-per-person answer key. They are separate from the video pipeline. Measured results and the candidate policy are in [the photo grouping evaluation](photo-grouping-evaluation.md).
 
 ```bash
 .venv/bin/python Scripts/provision_photo_models.py --models w600k-r50,glintr100,lvface-b
@@ -102,7 +102,7 @@ The `photos` commands group still photos by person and measure the result agains
 - `group` applies a policy file and writes the groups file that the browser GUI reads. `identify` measures the alternative of matching faces to a few named example photos per person.
 - `Scripts/evaluate_photo_grouping.sh` runs analyze, verify, and calibrate for several models on the GPU and writes a short `summary.txt`.
 
-The grouping policy is constrained average-linkage clustering. Faces in the same photo never share a group. An optional second step merges two clusters of at least three faces when their mean cross similarity, divided by the geometric mean of their own mean internal similarities, passes a threshold; this joins one person's looks that the first step kept apart. A lone face joins a group only when the mean of its top-k similarities to the group passes a threshold and leads the next group by a margin; otherwise it is listed for review with suggested groups. Group pairs that may be one person are listed as merge suggestions; only the user's confirmation merges them. All thresholds are uncalibrated until `calibrate` has run on representative labelled photos. The candidate recognition models have non-commercial licences.
+The grouping policy is constrained average-linkage clustering. Faces in the same photo never share a group. An optional second step merges two clusters of at least three faces when their mean cross similarity, divided by the geometric mean of their own mean internal similarities, passes a threshold; this joins one person's looks that the first step kept apart. With `cluster_auto_max_size`, two clusters that are both larger than that size never merge automatically; they can only become a merge suggestion, so one wrong decision cannot join two whole people. A lone face joins a group only when the mean of its top-k similarities to the group passes a threshold and leads the next group by a margin; otherwise it is listed for review with suggested groups. Group pairs that may be one person are listed as merge suggestions; only the user's confirmation merges them. All thresholds are uncalibrated until `calibrate` has run on representative labelled photos. The candidate recognition models have non-commercial licences.
 
 ## Current implementation context
 
