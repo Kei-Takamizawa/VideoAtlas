@@ -52,6 +52,35 @@ git diff --check
 
 The optional genuine-model integration test needs locally downloaded models and an official sample image at `videoatlas/resources/model-smoke.jpg`; it skips when they are absent. Synthetic fixtures test application behavior. They are not an accuracy benchmark. The application entry point requires Windows; checks on another OS do not establish Windows GUI, playback, or GPU behavior.
 
+## Linux server (headless processing)
+
+The analysis engine also runs on 64-bit Linux without a display. The desktop GUI entry point (`python -m videoatlas`) remains Windows-only. Use Python 3.12, because the pinned NumPy release does not support newer versions. With [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv python install 3.12
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements-linux-gpu.txt pytest
+.venv/bin/python Scripts/download_face01.py
+```
+
+Install the NVIDIA driver on the host; CUDA and cuDNN come from the pip packages. The Qt-based tests also need these Ubuntu packages: `libgl1 libegl1 libopengl0 libfontconfig1 libxkbcommon0 libdbus-1-3 libpulse0 libxrandr2`. Run the suite offscreen:
+
+```bash
+mkdir -p .test-artifacts
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q --basetemp=.test-artifacts/pytest
+```
+
+Headless commands:
+
+```bash
+.venv/bin/python -m videoatlas.cli doctor
+.venv/bin/python -m videoatlas.cli images PHOTO_FOLDER --output RUN_FOLDER
+```
+
+`doctor` loads the models and reports the ONNX Runtime providers that each model registered. `images` detects, aligns, and embeds every face in a photo folder, then writes `faces.jsonl`, `embeddings.npz`, and `report.json` to a new output folder, which must be outside the photo folder. When the photo folder has one subfolder per person, the folder names serve only as an offline answer key for a single-image pair evaluation after inference.
+
+GPU use is explicit. `--device cuda` is the default and stops with an error when any model cannot run on the GPU. `--device auto` permits a CPU fallback and logs a warning. `--device cpu` uses the CPU only. The same rule applies to the `acceleration` setting everywhere: `cuda` and `tensorrt` now fail instead of falling back to the CPU, and `auto` logs any fallback. TensorRT loading remains Windows-only. The check covers which providers a session registered; ONNX Runtime may still place individual unsupported operators on the CPU inside a CUDA session.
+
 ## Current implementation context
 
 The engine uses SCRFD landmarks, model-specific FACE01/AdaFace alignment and normalization, and versioned embedding spaces. Numerical GPU/CPU profiles remain separate. Track decisions aggregate multiple quality-filtered samples, and automatic clustering requires HIGH comparisons with every cluster member. Uncalibrated automatic merging is disabled by default; upper-face automatic merging remains unavailable pending calibration.

@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from .recognition import RecognitionOptions, default_config_path
-from .model_adapters import SCRFDDetector, AdaFaceAdapter, align_crop, face01_tensor, FACE01_PREPROCESSING, ADAFACE_PREPROCESSING, configure_windows_nvidia_libraries, landmark_visibility_proxy, preprocessing_identity, upper_visible_mask, FACE01_TEMPLATE
+from .model_adapters import SCRFDDetector, AdaFaceAdapter, align_crop, face01_tensor, FACE01_PREPROCESSING, ADAFACE_PREPROCESSING, configure_windows_nvidia_libraries, gpu_required, landmark_visibility_proxy, preprocessing_identity, upper_visible_mask, FACE01_TEMPLATE
 
 
 @dataclass
@@ -64,6 +64,8 @@ _FACE01_MODEL_SHA256 = "e7ca51f4bc85f73ddb830683ac6a09077909fa45a52b2bff41a9c6e8
 _EMBEDDING_SIZE = 512
 _CUDA_ARENA_BYTES = 2 * 1024 ** 3
 _TRT_WORKSPACE_BYTES = 1024 ** 3
+_GPU_LIBRARY_PREFIXES = ("cud", "cublas", "cufft", "curand", "cusparse", "nvinfer", "nvonnxparser", "nvrtc", "nvcuda", "nvjitlink")
+_PROC_MAPS = Path("/proc/self/maps")
 
 
 def _sha256_file(path: Path) -> str:
@@ -91,6 +93,32 @@ def _dll_identity(path: Path) -> tuple[str, str]:
 
 
 def _loaded_gpu_dlls() -> tuple[tuple[str, str], ...]:
+    if sys.platform == "win32":
+        return _loaded_gpu_dlls_windows()
+    return _loaded_gpu_libraries_linux()
+
+
+def _is_gpu_library(name: str) -> bool:
+    name = name.lower()
+    return ".so" in name and name.removeprefix("lib").startswith(_GPU_LIBRARY_PREFIXES)
+
+
+def _loaded_gpu_libraries_linux() -> tuple[tuple[str, str], ...]:
+    """Identify mapped CUDA/cuDNN shared objects and their sibling libraries."""
+    paths: set[Path] = set()
+    with _PROC_MAPS.open(encoding="utf-8", errors="replace") as maps:
+        for line in maps:
+            fields = line.split(maxsplit=5)
+            if len(fields) == 6 and fields[5].startswith("/"):
+                path = Path(fields[5].strip())
+                if _is_gpu_library(path.name):
+                    paths.add(path)
+    for directory in {path.parent for path in paths}:
+        paths.update(path for path in directory.glob("lib*.so*") if _is_gpu_library(path.name))
+    return tuple(sorted(_dll_identity(path) for path in paths if path.is_file()))
+
+
+def _loaded_gpu_dlls_windows() -> tuple[tuple[str, str], ...]:
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     psapi = ctypes.WinDLL("psapi", use_last_error=True)
     kernel.GetCurrentProcess.restype = ctypes.c_void_p
@@ -121,7 +149,7 @@ def _gpu_identity(device_id: int) -> tuple[object, ...] | None:
     if os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("CUDA_DEVICE_ORDER"):
         return None
     try:
-        driver = ctypes.WinDLL("nvcuda.dll")
+        driver = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
         driver.cuInit.argtypes = [ctypes.c_uint]
         driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
         driver.cuDeviceGetUuid_v2.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -139,7 +167,7 @@ def _gpu_identity(device_id: int) -> tuple[object, ...] | None:
         if any(result != 0 for result in results) or not any(uuid) or version.value <= 0:
             return None
         dlls = _loaded_gpu_dlls()
-        names = [Path(path).name.lower() for path, _ in dlls]
+        names = [Path(path).name.lower().removeprefix("lib") for path, _ in dlls]
         if not any(name.startswith("cudart") for name in names) or not any(name.startswith("cudnn") for name in names):
             return None
         return (bytes(uuid).hex(), version.value, memory.value, dlls)
@@ -160,8 +188,8 @@ class VideoAnalyzer:
         return preprocessing_identity('adaface', self.options.recognition_region)
 
     def __init__(self, options: RecognitionOptions | None = None) -> None:
-        if sys.platform != "win32":
-            raise RuntimeError("VideoAtlas supports Windows only")
+        if sys.platform not in ("win32", "linux"):
+            raise RuntimeError("VideoAtlas analysis supports Windows and Linux only")
         config_path = default_config_path()
         self.options = options or RecognitionOptions.load(config_path if config_path.is_file() else None)
         self.options.validate()
@@ -184,6 +212,8 @@ class VideoAnalyzer:
             if self.model_path == default_model.resolve() and self.model_sha256 != _FACE01_MODEL_SHA256:
                 raise RuntimeError(f"FACE01 model checksum mismatch: {self.model_path}")
             if self.options.tensorrt_dll_dir is not None:
+                if sys.platform != "win32":
+                    raise ValueError("tensorrt_dll_dir is supported on Windows only")
                 dll_dir = self.options.tensorrt_dll_dir.expanduser().resolve()
                 if not dll_dir.is_dir():
                     raise FileNotFoundError(f"TensorRT DLL directory does not exist: {dll_dir}")
@@ -240,8 +270,10 @@ class VideoAnalyzer:
         if requested != "cpu":
             configure_windows_nvidia_libraries()
             preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if balanced and requested in {"auto", "tensorrt"}:
+            if balanced and requested in {"auto", "tensorrt"} and sys.platform == "win32":
                 preferred.insert(0, "TensorrtExecutionProvider")
+            elif requested == "tensorrt" and sys.platform != "win32":
+                notes.append("TensorRT skipped: VideoAtlas loads TensorRT on Windows only")
             elif requested == "tensorrt":
                 notes.append("TensorRT skipped: Accurate requires CUDA FP32 with TF32 disabled")
             if hasattr(ort, "preload_dlls"):
@@ -262,7 +294,7 @@ class VideoAnalyzer:
         runtime_identity = None
         try:
             capi_path = Path(ort.__file__).resolve().parent / "capi"
-            files = sorted((*capi_path.glob("*.dll"), *capi_path.glob("*.pyd")))
+            files = sorted((*capi_path.glob("*.dll"), *capi_path.glob("*.pyd"), *capi_path.glob("*.so")))
             if files and version != "unknown":
                 runtime_identity = (version, tuple(_dll_identity(path) for path in files), ort.get_build_info())
         except (AttributeError, OSError):
@@ -324,7 +356,9 @@ class VideoAnalyzer:
                 candidates.append(providers)
             if "CUDAExecutionProvider" in preferred and "CUDAExecutionProvider" in available:
                 candidates.append([("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"])
-            candidates.append(["CPUExecutionProvider"])
+            require_gpu = gpu_required(self.options)
+            if not require_gpu:
+                candidates.append(["CPUExecutionProvider"])
             state = None
             for providers in candidates:
                 label = tuple(item[0] if isinstance(item, tuple) else item for item in providers)
@@ -363,9 +397,13 @@ class VideoAnalyzer:
                         _SESSION_CACHE[cache_key] = state
                         while len(_SESSION_CACHE) > 2:
                             _SESSION_CACHE.popitem(last=False)
+                    if requested != "cpu" and actual[0] == "CPUExecutionProvider":
+                        logging.getLogger(__name__).warning("FACE01 runs on the CPU although acceleration is %s: %s", requested, " | ".join(notes) or "no GPU provider")
                     return state, self._provider_report(state, version, notes)
                 except Exception as error:
                     notes.append(f"{', '.join(label)} initialization failed: {error}")
+            if require_gpu:
+                raise RuntimeError("GPU acceleration was requested, but FACE01 could not start on the GPU: " + (" | ".join(notes) or "no GPU provider"))
             raise RuntimeError("Could not initialize FACE01: " + " | ".join(notes))
 
     def _safe_tensorrt_cache(self, runtime_identity: object, gpu_identity: object, trt_options: dict, cuda_options: dict) -> Path | None:
@@ -570,6 +608,38 @@ class VideoAnalyzer:
                 self._active = False
                 if self._closed:
                     self._release_resources()
+
+    def analyze_image(self, image: np.ndarray, stop: Callable[[], bool] | None = None) -> list[FaceSample] | None:
+        """Detect, align, and embed every face in one BGR uint8 still image.
+
+        Returns None when stopped. Each face is a single-image sample; callers
+        must not treat one image as multi-sample identity evidence.
+        """
+        if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1:
+            raise ValueError("image must be a BGR uint8 array")
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Analyzer is closed")
+            if self._active:
+                raise RuntimeError("Analyzer is already processing")
+            self._active = True
+        try:
+            samples, _ = self._process_frame(np.ascontiguousarray(image), 0.0, stop, False)
+            return samples
+        finally:
+            with self._lifecycle_lock:
+                self._active = False
+                if self._closed:
+                    self._release_resources()
+
+    def execution_providers(self) -> dict[str, tuple[str, ...]]:
+        """Registered ONNX Runtime providers for each loaded model."""
+        providers = {"face01": tuple(self._state.providers)}
+        if self._detector is not None:
+            providers["scrfd"] = tuple(self._detector.runner.session.get_providers())
+        if self._adaface is not None:
+            providers["adaface"] = tuple(self._adaface.runner.session.get_providers())
+        return providers
 
     def _stopped(self, stop: Callable[[], bool] | None) -> bool:
         return self._closed or (stop is not None and stop())
@@ -780,7 +850,7 @@ class VideoAnalyzer:
                     else:
                         output = self._session.run([self._output.name], {self._input.name: batch})[0]
                 except Exception:
-                    if self._state.providers == ('CPUExecutionProvider',):
+                    if self._state.providers == ('CPUExecutionProvider',) or gpu_required(self.options):
                         raise
                     logging.getLogger(__name__).exception('FACE01 GPU execution failed; retrying on CPU')
                     failed_state = self._state

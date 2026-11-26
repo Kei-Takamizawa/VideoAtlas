@@ -41,6 +41,17 @@ The current Windows environment uses Python 3.12.14, NumPy 1.26.4, OpenCV 4.11.0
 
 Synthetic tests exercise software paths. Real-video score evaluations below cover a small selected cohort. Neither automated test counts nor inference success are an accuracy percentage.
 
+## Linux headless processing
+
+Checked on November 26, 2026 UTC in an Ubuntu 26.04 container with an NVIDIA RTX 4060 Ti (driver 595.91.07), Python 3.12.16, ONNX Runtime GPU 1.22.0, and the CUDA 12.9 and cuDNN 9.28 pip packages. The desktop GUI was not started; Qt tests ran offscreen.
+
+- Full automated suite: **130 passed, 1 skipped**. The skipped test is the optional genuine-model image test, whose sample image was absent.
+- `python -m videoatlas.cli doctor`: SCRFD and FACE01 registered the CUDA provider, and the FACE01 numerical profile had a reproducible runtime identity. With `--device cpu`, both registered only the CPU provider.
+- Photo folder run: 4,619 still images of 8 people, one folder per person, took **76.1 seconds (60.7 images/s)**. This includes decoding, detection, alignment, crop caching, and FACE01 embedding. Each image contributes at most one face, its largest detected face, and only if that face was accepted: 3,018 images (65.3%) did. Most rejected faces were below the 80-pixel minimum (2,145 faces); about half of the images are 200–399 pixels on the short side.
+- CPU/GPU parity on 29 faces from the same folder: the maximum absolute FACE01 embedding difference was **1.23 × 10⁻⁴**.
+- Single-image FACE01 pair scores over those faces: 665,245 same-person and 3,887,408 different-person pairs. AUC was **0.756**. The median same-person score was 0.163; the median different-person score was 0.060. At 0.50, precision was 88.4%, recall 2.6%, and the false-positive rate 0.06%. Six different-folder pairs scored at least 0.95: four were byte-identical files stored under two people, and two were near-duplicates. Recall with zero false positives was therefore 0.
+- These are score-only results without AdaFace or the multi-sample HIGH policy. They do not establish grouping accuracy, but they show that single FACE01 embeddings separate these people weakly.
+
 ## Supplied real-video evaluation
 
 The supplied collection contains 20 videos, 407.02 seconds in total. Filenames provide an offline answer key only after inference. One expected-subject track per video was selected from a visually inspected gallery; companions remain in the application but are excluded from this labelled cohort. There are 190 unordered video pairs: 30 same-person and 160 different-person pairs.
