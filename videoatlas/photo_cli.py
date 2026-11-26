@@ -142,6 +142,17 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_identify(args) -> int:
+    from .photo_evaluation import identification_report
+    from .photos import load_run
+    run = load_run(args.run, args.models)
+    result = {name: identification_report(run, name, args.enroll, args.repeats, max_wrong_rate=args.max_wrong) for name in args.models}
+    _write_json(args.output, result)
+    print(json.dumps({name: {size: entry["best_within_limit"] for size, entry in data["enroll_sizes"].items()}
+                      for name, data in result.items()}, indent=2))
+    return 0
+
+
 def cmd_group(args) -> int:
     from .photo_evaluation import grouping_metrics
     from .photo_grouping import GroupingPolicy, group_faces, groups_document, write_groups
@@ -197,6 +208,15 @@ def add_photo_commands(commands, common) -> None:
         calibrate.add_argument("--linkage", choices=("average", "complete"), default="average")
         calibrate.add_argument("--review-threshold", type=float, help="lowest score at which a group is suggested for a review face")
         calibrate.set_defaults(handler=handler)
+
+    identify = actions.add_parser("identify", help="measure matching against a few named example photos per person")
+    identify.add_argument("run", type=Path)
+    identify.add_argument("--models", type=_models, required=True)
+    identify.add_argument("--output", type=Path, required=True)
+    identify.add_argument("--enroll", type=lambda value: [int(item) for item in value.split(",")], default=[3, 5, 10, 20])
+    identify.add_argument("--repeats", type=int, default=5)
+    identify.add_argument("--max-wrong", type=float, default=0.001)
+    identify.set_defaults(handler=cmd_identify)
 
     group = actions.add_parser("group", help="group a run with a policy file and write the groups file")
     group.add_argument("run", type=Path)

@@ -319,3 +319,14 @@ def test_two_faces_from_one_photo_cannot_both_attach_to_one_group():
     result = group_faces(run, GroupingPolicy(("m",), merge_threshold=.999, attach_threshold=.8, min_group_size=3))
     assert sorted(result.labels[3:].tolist()) == [UNGROUPED, 0]
     assert result.labels[3] == 0  # the closer face wins
+
+
+def test_identification_counts_unknown_people_as_wrong_when_accepted():
+    from videoatlas.photo_evaluation import identification_report
+    run = synthetic_people(people=4, photos=12, spread=.3)
+    report = identification_report(run, "m", enroll_sizes=(3,), repeats=2, thresholds=[-1.0, .5, .99])
+    table = report["enroll_sizes"]["3"]["table"]
+    loose, strict = table[0], table[-1]
+    assert loose["unknown_accepted"] > 0 and loose["wrong_rate"] > .2
+    assert strict["unknown_accepted"] == 0 and strict["known_wrong"] == 0
+    assert report["enroll_sizes"]["3"]["best_within_limit"]["wrong_rate"] <= .001

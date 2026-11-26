@@ -414,3 +414,68 @@ def impostor_normalization(run: RunData, models: Iterable[str], labels: np.ndarr
         offsets.append(float(scores.mean()))
         scales.append(float(scores.std()) or 1.0)
     return tuple(offsets), tuple(scales)
+
+
+# ------------------------------------------------- known-people identification
+
+def identification_report(run: RunData, model: str, enroll_sizes: Iterable[int] = (3, 5, 10, 20), repeats: int = 5,
+                          top_m: int = 3, margin: float = .05, thresholds: Iterable[float] | None = None,
+                          max_wrong_rate: float = .001, seed: int = 0) -> dict:
+    """Open-set identification against a small gallery of named example photos.
+
+    This measures the alternative to unsupervised grouping: the user names a few
+    photos per person, and each new face is matched to the closest person, or
+    to nobody. Every person takes a turn as an unknown person who has no
+    gallery, so accepting any of their faces counts as a wrong assignment.
+    Gallery and query photos come from the same folders, so near-duplicate
+    photos can make the results optimistic.
+    """
+    labels = face_labels(run)
+    keep, names, codes = _keep_and_codes(labels)
+    vectors = run.embeddings[model][keep]
+    similarity = vectors @ vectors.T
+    thresholds = list(thresholds) if thresholds is not None else [round(value, 3) for value in np.arange(.10, .901, .025)]
+    generator = np.random.default_rng(seed)
+    members = [np.flatnonzero(codes == code) for code in range(len(names))]
+    sizes = {}
+    for size in enroll_sizes:
+        counts = np.zeros((len(thresholds), 4), np.int64)  # known correct, known wrong, known total, unknown accepted
+        unknown_total = 0
+        for _ in range(repeats):
+            gallery = [generator.choice(indexes, size, replace=False) if len(indexes) > size else None for indexes in members]
+            if any(item is None for item in gallery):
+                continue
+            in_gallery = np.zeros(len(keep), bool)
+            for item in gallery:
+                in_gallery[item] = True
+            queries = np.flatnonzero(~in_gallery)
+            take = min(top_m, size)
+            person_scores = np.stack([np.partition(similarity[np.ix_(queries, item)], -take, axis=1)[:, -take:].mean(axis=1)
+                                      for item in gallery], axis=1)
+            truth = codes[queries]
+            for unknown in range(len(names)):
+                scores = person_scores.copy()
+                scores[:, unknown] = -math.inf
+                order = np.argsort(-scores, axis=1)
+                best_person = order[:, 0]
+                best = scores[np.arange(len(queries)), best_person]
+                second = scores[np.arange(len(queries)), order[:, 1]] if scores.shape[1] > 2 else np.full(len(queries), -math.inf)
+                is_unknown = truth == unknown
+                unknown_total += int(is_unknown.sum())
+                for row, threshold in enumerate(thresholds):
+                    accepted = (best >= threshold) & (best - second >= margin)
+                    counts[row, 0] += int(np.sum(accepted & ~is_unknown & (best_person == truth)))
+                    counts[row, 1] += int(np.sum(accepted & ~is_unknown & (best_person != truth)))
+                    counts[row, 2] += int(np.sum(~is_unknown))
+                    counts[row, 3] += int(np.sum(accepted & is_unknown))
+        table = []
+        for threshold, (correct, wrong, known, unknown_accepted) in zip(thresholds, counts):
+            total = known + unknown_total
+            table.append({"threshold": threshold, "correct_rate": _ratio(correct, known),
+                          "wrong_rate": _ratio(wrong + unknown_accepted, total),
+                          "known_wrong": int(wrong), "unknown_accepted": int(unknown_accepted), "queries": int(total)})
+        safe = [row for row in table if row["wrong_rate"] is not None and row["wrong_rate"] <= max_wrong_rate]
+        sizes[str(size)] = {"best_within_limit": max(safe, key=lambda row: row["correct_rate"] or 0) if safe else None, "table": table}
+    return {"model": model, "people": len(names), "faces": int(len(keep)), "repeats": repeats, "top_m": top_m, "margin": margin,
+            "max_wrong_rate": max_wrong_rate, "enroll_sizes": sizes,
+            "note": "Threshold chosen on the same people it is measured on, and gallery photos may be near-duplicates of queries: optimistic."}
