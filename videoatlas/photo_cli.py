@@ -30,7 +30,11 @@ def _grid(value: str) -> list[float]:
 
 
 def _attach_grid(value: str) -> list[float | None]:
-    return [None] if value.strip().lower() == "none" else _grid(value)
+    """Like a grid; the item "none" means no attach step."""
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    keep_none = any(item.lower() == "none" for item in items)
+    rest = ",".join(item for item in items if item.lower() != "none")
+    return ([None] if keep_none else []) + (_grid(rest) if rest else [])
 
 
 def _write_json(path: Path, data: dict) -> None:
