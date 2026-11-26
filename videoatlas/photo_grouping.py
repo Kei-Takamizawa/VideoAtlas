@@ -261,7 +261,9 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
             else:
                 best_scores, second_scores = scores[:, 0], np.full(len(leftovers), -math.inf)
             best_groups = np.argmax(scores, axis=1)
-            eligible = (~gated[leftovers]) & (best_scores >= policy.attach_threshold) & (best_scores - second_scores >= policy.attach_margin)
+            with np.errstate(invalid="ignore"):  # -inf minus -inf: no open group, never eligible
+                lead = best_scores - second_scores
+            eligible = (~gated[leftovers]) & (best_scores >= policy.attach_threshold) & (lead >= policy.attach_margin)
             for position in sorted(np.flatnonzero(eligible), key=lambda item: -float(best_scores[item])):
                 face, group = leftovers[position], int(best_groups[position])
                 # Two faces from one photo may both qualify; the stronger one takes the group.
