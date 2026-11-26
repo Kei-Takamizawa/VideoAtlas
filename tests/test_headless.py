@@ -37,22 +37,26 @@ def test_image_files_are_filtered_sorted_and_labelled(tmp_path):
 
 def test_analyze_images_reports_unreadable_files_and_stops_cleanly(tmp_path):
     (tmp_path / "A").mkdir()
-    assert cv2.imwrite(str(tmp_path / "A" / "ok.png"), np.full((20, 30, 3), 90, np.uint8))
+    ok, encoded = cv2.imencode(".png", np.full((20, 30, 3), 90, np.uint8))
+    (tmp_path / "A" / "ok.png").write_bytes(encoded.tobytes())
+    (tmp_path / "A" / "写真.png").write_bytes(encoded.tobytes())
     (tmp_path / "A" / "broken.jpg").write_bytes(b"not an image")
     seen = []
     fake = SimpleNamespace(analyze_image=lambda image, stop: seen.append(image.shape) or [face((0, 0, .5, .5), [1., 0.])])
     results = list(analyze_images(fake, iter_image_files(tmp_path), tmp_path))
-    assert [(result.path.name, result.error, len(result.faces)) for result in results] == [("broken.jpg", "unreadable_image", 0), ("ok.png", None, 1)]
-    assert seen == [(20, 30, 3)] and results[1].width == 30 and results[1].height == 20
+    assert [(result.path.name, result.error, len(result.faces)) for result in results] == [("broken.jpg", "unreadable_image", 0), ("ok.png", None, 1), ("写真.png", None, 1)]
+    assert seen == [(20, 30, 3)] * 2 and results[1].width == 30 and results[1].height == 20
     stopped = SimpleNamespace(analyze_image=lambda image, stop: None)
     assert list(analyze_images(stopped, [tmp_path / "A" / "ok.png"], tmp_path)) == []
 
 
-def test_primary_face_is_the_largest_accepted_face():
-    result = ImageResult(Path("a.png"), "A", faces=[face((0, 0, .9, .9), None, "pose_yaw_out_of_range"),
-                                                    face((0, 0, .2, .2), [1., 0.]), face((0, 0, .3, .4), [0., 1.])])
-    assert primary_face(result).embedding == [0., 1.]
-    assert primary_face(ImageResult(Path("b.png"), "A", faces=[face((0, 0, .5, .5), None, "blur_too_high")])) is None
+def test_primary_face_is_the_largest_face_only_when_accepted():
+    accepted = ImageResult(Path("a.png"), "A", faces=[face((0, 0, .2, .2), [1., 0.]), face((0, 0, .3, .4), [0., 1.])])
+    assert primary_face(accepted).embedding == [0., 1.]
+    # A rejected subject must not hand its label to a smaller accepted bystander.
+    bystander = ImageResult(Path("b.png"), "A", faces=[face((0, 0, .9, .9), None, "quality_below_threshold"), face((0, 0, .2, .2), [1., 0.])])
+    assert primary_face(bystander) is None
+    assert primary_face(ImageResult(Path("c.png"), "A")) is None
 
 
 def test_pair_report_counts_thresholds_auc_and_zero_false_positive_recall():
@@ -67,7 +71,10 @@ def test_pair_report_counts_thresholds_auc_and_zero_false_positive_recall():
     assert report["auc"] == pytest.approx(.75)
     assert report["max_negative_score"] == pytest.approx(.96)
     assert report["recall_with_zero_false_positives"] == 0
+    assert pair_report(labels, vectors, thresholds=[.7], block_size=1) == report
     assert pair_report(["a"], np.ones((1, 2)))["pair_count"] == 0
+    single_person = pair_report(["a", "a"], np.ones((2, 2)))
+    assert single_person["negative_count"] == 0 and single_person["recall_with_zero_false_positives"] is None
     with pytest.raises(ValueError):
         pair_report(["a", "b"], np.zeros((2, 2)))
 
@@ -112,12 +119,47 @@ def test_cli_images_writes_outputs_and_refuses_to_overwrite(tmp_path, monkeypatc
     assert all(line["primary_face"] == 0 and line["faces"][0]["accepted"] for line in lines)
     report = json.loads((output / "report.json").read_text())
     assert report["image_count"] == 5 and report["pairs"]["positive_count"] == 4 and report["pairs"]["negative_count"] == 6
-    assert report["labels"]["A"]["images_with_accepted_face"] == 3
+    assert report["labels"]["A"]["images_with_accepted_primary_face"] == 3
     saved = np.load(output / "embeddings.npz")
     assert saved["vectors"].shape == (5, 2) and list(saved["labels"]) == ["A", "A", "A", "B", "B"]
+    assert set(saved["embedding_models"]) == {"fake"}
     capsys.readouterr()
     assert cli.main(["images", str(root), "--output", str(output)]) == 1
     assert "already exists" in capsys.readouterr().err
+
+
+def test_cli_images_refuses_output_inside_the_photo_folder(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "photos"
+    (root / "A").mkdir(parents=True)
+    monkeypatch.setattr(cli, "open_analyzer", lambda options: pytest.fail("must not load models"))
+    assert cli.main(["images", str(root), "--output", str(root / "run")]) == 1
+    assert cli.main(["images", str(root), "--output", str(tmp_path / "run"), "--cache-dir", str(root / "cache")]) == 1
+    assert "must be outside the photo folder" in capsys.readouterr().err
+    assert not (root / "run").exists()
+
+
+def test_cli_images_never_compares_mixed_embedding_models(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    for label in ("A", "B"):
+        (root / label).mkdir(parents=True)
+        for index in range(2):
+            assert cv2.imwrite(str(root / label / f"{index}.png"), np.full((8, 8, 3), 40 + index, np.uint8))
+    class Switching(FakeAnalyzer):
+        calls = 0
+        def analyze_image(self, image, stop=None):
+            self.calls += 1
+            if self.calls == 3:
+                self.embedding_model, self.providers = "face01:cpu-runtime-fallback", ("CPUExecutionProvider",)
+            sample = face((0, 0, .5, .5), [1., self.calls / 10])
+            sample.embedding_model = self.embedding_model
+            return [sample]
+    monkeypatch.setattr(cli, "open_analyzer", lambda options: Switching())
+    output = tmp_path / "run"
+    assert cli.main(["images", str(root), "--output", str(output), "--device", "auto"]) == 0
+    report = json.loads((output / "report.json").read_text())
+    assert report["pairs"]["skipped"] and report["pairs"]["pair_count"] == 0
+    assert report["runtime"]["providers"]["face01"] == ["CPUExecutionProvider"]
+    assert report["runtime_at_start"]["providers"]["face01"][0] == "CUDAExecutionProvider"
 
 
 def fake_onnxruntime(available, registered):

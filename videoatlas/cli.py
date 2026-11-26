@@ -78,6 +78,10 @@ def cmd_images(args) -> int:
     from .images import analyze_images, iter_image_files, pair_report, primary_face, update_label_stats
     root = args.root.expanduser().resolve()
     output = args.output.expanduser().resolve()
+    cache = (args.cache_dir or output / "aligned-cache").expanduser().resolve()
+    for flag, folder in (("--output", output), ("--cache-dir", cache)):
+        if folder == root or folder.is_relative_to(root):
+            raise ValueError(f"{flag} must be outside the photo folder {root}, or later runs would read its files as photos")
     existing = [name for name in OUTPUT_FILES if (output / name).exists()]
     if existing:
         raise FileExistsError(f"Output already exists in {output}: {', '.join(existing)}. Choose a new --output folder.")
@@ -89,10 +93,10 @@ def cmd_images(args) -> int:
     if not paths:
         raise ValueError(f"No images found below {root}")
     output.mkdir(parents=True, exist_ok=True)
-    options = build_options(args.config, args.device, args.cache_dir or output / "aligned-cache")
+    options = build_options(args.config, args.device, cache)
     analyzer = open_analyzer(options)
     started = time.monotonic()
-    labels, vectors, sources, stats = [], [], [], {}
+    labels, vectors, sources, models, stats = [], [], [], [], {}
     try:
         require_device(analyzer, args.device)
         runtime = describe_runtime(analyzer)
@@ -115,16 +119,26 @@ def cmd_images(args) -> int:
                     labels.append(result.label)
                     vectors.append(primary.embedding)
                     sources.append(relative)
+                    models.append(primary.embedding_model)
+        # An auto-mode run can switch to the CPU midway; report the final runtime too.
+        runtime_end = describe_runtime(analyzer)
     finally:
         analyzer.close()
     elapsed = time.monotonic() - started
     matrix = np.asarray(vectors, np.float32) if vectors else np.zeros((0, 0), np.float32)
     np.savez_compressed(output / "embeddings.npz", vectors=matrix, labels=np.asarray(labels), paths=np.asarray(sources),
-                        embedding_model=np.asarray(runtime["embedding_model"]))
-    pairs = pair_report(labels, matrix)
+                        embedding_models=np.asarray(models))
+    distinct_models = sorted(set(models))
+    if len(distinct_models) > 1:
+        # Embedding spaces from different numerical profiles are never compared.
+        pairs = {"skipped": "primary faces use more than one embedding model", "embedding_models": distinct_models, "pair_count": 0,
+                 "auc": None, "recall_with_zero_false_positives": None}
+        logging.getLogger(__name__).warning("Pair evaluation skipped: %d embedding models in one run", len(distinct_models))
+    else:
+        pairs = pair_report(labels, matrix)
     report = {"created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "image_count": len(paths),
               "elapsed_seconds": round(elapsed, 2), "images_per_second": round(len(paths) / elapsed, 2) if elapsed > 0 else None,
-              "device": args.device, "runtime": runtime,
+              "device": args.device, "runtime": runtime_end, "runtime_at_start": runtime if runtime != runtime_end else None,
               "options": {name: getattr(options, name) for name in ("acceleration", "precision", "recognition_region", "detection_threshold",
                                                                      "min_face_size", "min_quality", "blur_threshold", "pose_threshold")},
               "labels": {label: {**entry, "rejections": dict(entry["rejections"])} for label, entry in sorted(stats.items())},
@@ -132,10 +146,10 @@ def cmd_images(args) -> int:
               "notes": ["Folder names are an offline answer key used only after inference.",
                         "Pair scores compare single images and are not the multi-sample HIGH grouping policy."]}
     (output / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    accepted = sum(entry["images_with_accepted_face"] for entry in stats.values())
-    print(json.dumps({"images": len(paths), "images_with_accepted_face": accepted, "pairs": pairs["pair_count"],
+    accepted = sum(entry["images_with_accepted_primary_face"] for entry in stats.values())
+    print(json.dumps({"images": len(paths), "images_with_accepted_primary_face": accepted, "pairs": pairs["pair_count"],
                       "auc": pairs["auc"], "recall_with_zero_false_positives": pairs["recall_with_zero_false_positives"],
-                      "elapsed_seconds": report["elapsed_seconds"], "providers": runtime["providers"],
+                      "elapsed_seconds": report["elapsed_seconds"], "providers": runtime_end["providers"],
                       "output": str(output)}, indent=2, ensure_ascii=False))
     return 0
 
