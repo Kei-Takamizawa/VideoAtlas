@@ -1,4 +1,5 @@
 .venv/
+.venv-web/
 .test-deps/
 .test-artifacts/
 .model-smoke-cache/
@@ -6,7 +7,7 @@
 .model-test-anchor-tmp*/
 .model-test-adaptive-tmp*/
 .gpu-test-deps/
-/videoatlas/resources/
+/videoatlas/resources
 venv/
 __pycache__/
 *.py[cod]

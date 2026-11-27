@@ -1,0 +1,50 @@
+"""Settings for the browser GUI server."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import os
+from pathlib import Path
+import sys
+
+# The only addresses the server may listen on. Each one must also be an allowed
+# Host name in app.py, or the GUI would refuse requests sent to its own address.
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def default_data_dir() -> Path:
+    """Folder for the GUI's database, access key, and future uploads."""
+    configured = os.environ.get("VIDEOATLAS_DATA_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / "videoatlas-data"
+
+
+@dataclass(frozen=True)
+class WebSettings:
+    data_dir: Path = field(default_factory=default_data_dir)
+    host: str = "127.0.0.1"
+    port: int = 8765
+    python: str = sys.executable
+    repo_root: Path = REPO_ROOT
+
+    def validate(self) -> None:
+        if self.host not in LOOPBACK_HOSTS:
+            raise ValueError(f"The GUI listens on a loopback address only ({', '.join(LOOPBACK_HOSTS)}); "
+                             f"{self.host!r} is not one. Use an SSH tunnel to reach it from another computer.")
+        if not 1024 <= self.port <= 65535:
+            raise ValueError(f"The port must be between 1024 and 65535, not {self.port}.")
+        if not (Path(self.python).is_file() and os.access(self.python, os.X_OK)):
+            raise ValueError(f"The engine Python {self.python!r} is not an executable file.")
+        if not (Path(self.repo_root) / "videoatlas" / "cli.py").is_file():
+            raise ValueError(f"The engine folder {str(self.repo_root)!r} has no videoatlas/cli.py.")
+
+    @property
+    def web_dir(self) -> Path:
+        return Path(self.data_dir) / "web"
+
+    @property
+    def jobs_db(self) -> Path:
+        return self.web_dir / "jobs.sqlite3"
+
+    @property
+    def key_file(self) -> Path:
+        return self.web_dir / "access-key"

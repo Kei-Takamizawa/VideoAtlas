@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Sign in · VideoAtlas{% endblock %}
+{% block content %}
+<section class="card login">
+  <h1>Sign in</h1>
+  <form method="post" action="/login">
+    <label for="key">Access key</label>
+    <input id="key" name="key" type="password" autocomplete="current-password" required autofocus>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="muted">To see the key, run <code>.venv-web/bin/python -m videoatlas.web print-key</code> in <code>~/videoatlas-app</code> on the server.</p>
+</section>
+{% endblock %}

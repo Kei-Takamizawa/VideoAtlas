@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}VideoAtlas{% endblock %}</title>
+  {% if csrf %}<meta name="csrf-token" content="{{ csrf }}">{% endif %}
+  <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"refreshOnHistoryMiss":true}'>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/vendor/htmx-2.0.11.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">VideoAtlas</span>
+    {% if csrf %}
+    <nav><a href="/" class="active">Home</a></nav>
+    <form method="post" action="/logout" class="signout">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <button type="submit" class="link">Sign out</button>
+    </form>
+    {% endif %}
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

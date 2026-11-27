@@ -26,6 +26,7 @@ For each task, identify the relevant requirements and code, implement the reques
 | `videoatlas/evaluation.py` | Reviewed-pair evaluation and candidate tuning |
 | `videoatlas/embedders.py`, `photos.py` | Replaceable recognition models and still-photo analysis runs |
 | `videoatlas/photo_grouping.py`, `photo_evaluation.py`, `photo_cli.py` | Photo grouping policy, accuracy measurement, and `photos` commands |
+| `videoatlas/web/` | Browser GUI: loopback-only FastAPI server, access key and sessions, job runner, templates, vendored htmx |
 | `Scripts/` | Windows setup, model provisioning, and offline evaluation tools |
 | `tests/` | Automated regression and optional genuine-model checks |
 
@@ -103,6 +104,18 @@ The `photos` commands group still photos by person and measure the result agains
 - `Scripts/evaluate_photo_grouping.sh` runs analyze, verify, and calibrate for several models on the GPU and writes a short `summary.txt`.
 
 The grouping policy is constrained average-linkage clustering. Faces in the same photo never share a group. An optional second step merges two clusters of at least three faces when their mean cross similarity, divided by the geometric mean of their own mean internal similarities, passes a threshold; this joins one person's looks that the first step kept apart. With `cluster_auto_max_size`, two clusters that are both larger than that size never merge automatically; they can only become a merge suggestion, so one wrong decision cannot join two whole people. A lone face joins a group only when the mean of its top-k similarities to the group passes a threshold and leads the next group by a margin; otherwise it is listed for review with suggested groups. Group pairs that may be one person are listed as merge suggestions; only the user's confirmation merges them. All thresholds are uncalibrated until `calibrate` has run on representative labelled photos. The candidate recognition models have non-commercial licences.
+
+## Browser GUI
+
+The browser GUI lives in `videoatlas/web/` and runs on the Linux server. See the [browser GUI guide](WEB_GUI.md) for starting it, the SSH tunnel, and its security model. It needs only the hash-pinned packages in `requirements-web.txt`, so its tests run without models, GPU, or Qt:
+
+```bash
+uv pip install --python .venv/bin/python --require-hashes -r requirements-web.txt
+uv pip install --python .venv/bin/python pytest httpx
+.venv/bin/python -m pytest -q tests/test_web_*.py
+```
+
+The web package never imports the analysis engine. It starts work as `python -m videoatlas.cli ...` subprocesses, one at a time, through the job runner in `videoatlas/web/jobs.py`. Add a new kind of job to `JOB_KINDS` with a fixed argument list; never build a shell command from user input. When you add or update a web dependency, pin a release that is at least 14 days old and regenerate `requirements-web.txt` with hashes from `requirements-web.in`.
 
 ## Current implementation context
 
