@@ -10,10 +10,11 @@
 2. ``--groups``: for each named person's main group in a groups file, the
    labelled people in it and the estimated person of its unlabelled faces.
 3. ``--remove-people``: the grouping is repeated without every photo of those
-   people (all copies of their files). For each named person's main group it
-   shows the same composition, split by how faces joined (clustering or the
-   attach step), which shows whether the removed people's faces in other
-   folders' group photos went into that group.
+   people (all copies of their files), except ``--keep`` random answer-key
+   photos of each (``--keep-photos``), as in the newcomer test. For each named person's main
+   group it shows the same composition, split by how faces joined (clustering
+   or the attach step). For each removed person it shows where their kept
+   faces and their estimated faces in other folders' group photos went.
 
 The estimated person is the labelled person with the highest mean score by a
 clear lead (``LikelyPerson``). It uses the same models as the grouping, so it
@@ -91,6 +92,8 @@ def main() -> int:
     parser.add_argument("--remove-people", type=_names)
     parser.add_argument("--people", type=_names, default=[])
     parser.add_argument("--lead", type=float, default=1.0, help="lead needed for an estimated person")
+    parser.add_argument("--keep-photos", type=int, default=0, help="answer-key photos kept per removed person")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.strangers:
         explain_strangers(args.strangers, args.keep)
@@ -120,11 +123,43 @@ def main() -> int:
         hashes = {photo["sha256"] for photo in run.photos if _known_label(photo) in removed}
         if not hashes:
             parser.error("no labelled photos for --remove-people")
-        rows = np.asarray([row for row, index in enumerate(run.face_photo) if run.photos[int(index)]["sha256"] not in hashes])
+        generator = np.random.default_rng(args.seed)
+        kept: dict[int, str] = {}
+        for person in sorted(removed):
+            pool = np.flatnonzero(labels == person)
+            for row in generator.choice(pool, size=min(args.keep_photos, len(pool)), replace=False) if len(pool) else []:
+                kept[int(row)] = person
+        rows = np.asarray(sorted({row for row, index in enumerate(run.face_photo) if run.photos[int(index)]["sha256"] not in hashes}
+                                 | set(kept)))
         sub = _subset(run, rows)
         result = group_faces(sub, policy)
-        sub_labels = labels[rows]
-        print(f"Without {', '.join(sorted(removed))}: {len(rows)} of {len(run.faces)} faces kept, {len(result.group_sizes)} groups")
+        sub_labels = labels[rows].copy()
+        position = {int(row): index for index, row in enumerate(rows)}
+        for row in kept:
+            sub_labels[position[row]] = None   # kept faces are newcomers: no label in the composition
+        print(f"Without {', '.join(sorted(removed))} (keeping {args.keep_photos} photos each): {len(rows)} of {len(run.faces)} faces, "
+              f"{len(result.group_sizes)} groups")
+        unlabelled_all = np.flatnonzero([label is None for label in sub_labels])
+        guess_all = dict(zip(unlabelled_all.tolist(), estimate(rows[unlabelled_all])))
+        new_groups = set(result.leftover_groups)
+
+        def describe(group: int) -> str:
+            members = np.flatnonzero(result.labels == group)
+            labelled = Counter(sub_labels[row] for row in members if sub_labels[row] is not None)
+            newcomers = Counter(kept[int(rows[row])] for row in members if int(rows[row]) in kept)
+            estimated = Counter(guess_all[row] for row in members if sub_labels[row] is None and int(rows[row]) not in kept)
+            return (f"group of {len(members)}{' (from leftovers)' if group in new_groups else ''}: labelled {dict(labelled.most_common(3))}, "
+                    f"kept newcomer faces {dict(newcomers.most_common(3))}, other unlabelled estimated "
+                    f"{dict((str(key), value) for key, value in estimated.most_common(3))}")
+
+        for person in sorted(removed):
+            for kind, faces in (("kept faces", [position[row] for row, name in kept.items() if name == person]),
+                                ("estimated faces in other photos", [row for row, guess in guess_all.items()
+                                                                    if guess == person and int(rows[row]) not in kept])):
+                placed = Counter(int(result.labels[row]) for row in faces)
+                print(f"{person}, {kind}: {len(faces)}; not grouped {placed.pop(UNGROUPED, 0)}")
+                for group, count in placed.most_common(5):
+                    print(f"  {count} in {describe(group)}")
         for person in args.people:
             values, counts = np.unique(result.labels[(result.labels != UNGROUPED) & (sub_labels == person)], return_counts=True)
             if not len(values):
