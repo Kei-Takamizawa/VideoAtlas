@@ -782,7 +782,7 @@ def _apply_leftover_settings(result: GroupingResult, similarity: np.ndarray, fac
     return applied
 
 
-class _LikelyPerson:
+class LikelyPerson:
     """Estimated person for unlabelled faces: the labelled person with the highest mean score, by a clear lead.
 
     It uses the same models as the grouping, so it is a rough estimate, not an answer key.
@@ -857,7 +857,7 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
     same batches, by outcome counts only, after the policy's other steps.
 
     Each wrong placement lists who else is in the group. Unlabelled faces get
-    an estimated person (``_LikelyPerson``, lead ``likely_lead``), which shows
+    an estimated person (``LikelyPerson``, lead ``likely_lead``), which shows
     whether a group of unlabelled faces is probably the newcomer seen in other
     photos. That estimate uses the same models, so it is not an answer key.
     """
@@ -891,7 +891,7 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
         raise ValueError("keep sizes, batch and repeats must be at least 1")
     own_setting = _policy_setting(policy)
     base_policy = replace(policy, leftover_merge_threshold=None) if grid else policy
-    likely = _LikelyPerson(run, policy, key, likely_lead)
+    likely = LikelyPerson(run, policy, key, likely_lead)
     report = {"method": stranger_test.__doc__.split("\n\n")[0].strip(), "people": focus, "repeats": repeats, "batch": batch,
               "seed": seed, "attach_threshold": policy.attach_threshold, "leftover_merge_threshold": policy.leftover_merge_threshold,
               "leftover_min_size": policy.leftover_min_size, "leftover_max_known_score": policy.leftover_max_known_score,
