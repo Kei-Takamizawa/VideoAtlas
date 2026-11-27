@@ -328,6 +328,11 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
     calibration_b = json.loads((tmp_path / "calibration-b.json").read_text())
     assert calibration_b["excluded_people"] == ["B"] and list(calibration_b["held_out"]["targets"]["0.0"]["folds"][0].values())[0] == "A"
     assert len(calibration_b["held_out"]["targets"]["0.0"]["folds"]) == 1
+    assert cli.main(["photos", "calibrate", str(run_folder), "--models", "fake", "--output", str(tmp_path / "calibration-c.json"),
+                     "--policy-output", str(tmp_path / "policy-c.json"), "--merge-grid", "0.5:0.9:0.2", "--attach-grid", "none",
+                     "--eye-grid", "0", "--targets", "0", "--policy-target", "0", "--exclude-people", "B", "--skip-held-out"]) == 0
+    assert json.loads((tmp_path / "calibration-c.json").read_text())["held_out"] is None
+    assert json.loads((tmp_path / "policy-c.json").read_text())["calibration"]["excluded_people"] == ["B"]
     assert groups["photos"]["A/broken.jpg"] == {"groups": [], "review_faces": [], "faces": 0}
 
 

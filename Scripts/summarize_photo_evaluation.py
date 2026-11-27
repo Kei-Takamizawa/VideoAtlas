@@ -52,8 +52,12 @@ def main(folder: str, intruders: bool = False) -> int:
         print(f"\nCalibration {path.stem}: {grid['settings']} settings, {data['elapsed_seconds']} s "
               f"(merge {grid['merge'][0]}..{grid['merge'][-1]}, attach {grid['attach']}, eye {grid['min_eye_distance']}, "
               f"cluster merge {grid['cluster_merge']})")
-        print("  held-out estimate by mixing limit (limit applied on the other people):")
-        for target, entry in data["held_out"]["targets"].items():
+        held_out = data["held_out"] or {"targets": {}}
+        if data.get("excluded_people"):
+            print(f"  kept out of tuning: {', '.join(data['excluded_people'])}")
+        print("  held-out estimate by mixing limit (limit applied on the other people):" if data["held_out"]
+              else "  held-out estimate: skipped (--skip-held-out)")
+        for target, entry in held_out["targets"].items():
             held = entry["held_out"]
             review = "; ".join(f"{row['budget']}: {pct(row['missing_rate'])}" for row in held["after_review"] if row["budget"])
             print(f"  - limit {pct(float(target))}: mixing {held['mixed_faces']}/{held['grouped_labelled_faces']} = {pct(held['mixing_rate'])}; "
@@ -65,7 +69,7 @@ def main(folder: str, intruders: bool = False) -> int:
                 print(f"      missing after answering the first N merge suggestions: {review}")
         target = str(float(data["policy_target"]))
         print(f"  folds at limit {pct(float(target))}:")
-        for fold in data["held_out"]["targets"].get(target, {}).get("folds", []):
+        for fold in held_out["targets"].get(target, {}).get("folds", []):
             policy = fold.get("policy")
             if policy is None:
                 print(f"  - {fold['held_out']}: no setting met the limit")

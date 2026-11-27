@@ -151,7 +151,7 @@ def cmd_calibrate(args) -> int:
     grid = SearchGrid(tuple(args.merge_grid), tuple(args.attach_grid), tuple(args.eye_grid), tuple(args.cluster_grid))
     targets = sorted(set(args.targets) | {args.policy_target})
     started = time.monotonic()
-    held_out = calibrate_leave_one_person_out(run, base, grid, targets)
+    held_out = None if args.skip_held_out else calibrate_leave_one_person_out(run, base, grid, targets)
     table = evaluate_grid(run, base, grid)
     all_people = {}
     for target in targets:
@@ -170,12 +170,16 @@ def cmd_calibrate(args) -> int:
     if policy is not None and args.policy_output:
         calibrated = replace(policy, review_threshold=args.review_threshold,
                              calibration={"run": str(args.run), "max_mixing_rate": args.policy_target,
-                                          "held_out": held_out["targets"][str(args.policy_target)]["held_out"]})
+                                          "held_out": held_out["targets"][str(args.policy_target)]["held_out"] if held_out else None,
+                                          "excluded_people": args.exclude_people or []})
         _write_json(args.policy_output, calibrated.to_json())
     _write_json(args.output, result)
     digest = {target: {key: entry["held_out"][key] for key in ("mixing_rate", "missing_rate", "folds_without_setting")}
-              for target, entry in held_out["targets"].items()}
-    print(json.dumps({"held_out": digest, "policy": policy.to_json() if policy else None}, indent=2, default=_json_default))
+              for target, entry in held_out["targets"].items()} if held_out else None
+    chosen = all_people[str(args.policy_target)]["metrics"]
+    print(json.dumps({"held_out": digest, "policy": policy.to_json() if policy else None,
+                      "tuning_people": {key: chosen[key] for key in ("mixing", "missing")} if chosen else None},
+                     indent=2, default=_json_default))
     return 0
 
 
@@ -300,6 +304,8 @@ def add_photo_commands(commands, common) -> None:
                            help="lowest normalized score at which two groups are suggested as one person")
     calibrate.add_argument("--max-suggestions", type=int, default=200)
     calibrate.add_argument("--review-threshold", type=float, help="lowest score at which a group is suggested for a review face")
+    calibrate.add_argument("--skip-held-out", action="store_true",
+                           help="only choose on all tuning people (much faster); test the policy with `photos group --people`")
     calibrate.set_defaults(handler=cmd_calibrate)
 
     adapt = actions.add_parser("adapt", help="whiten embeddings with the within-person spread of a first grouping (no labels used)")
