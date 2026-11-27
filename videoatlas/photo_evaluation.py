@@ -726,6 +726,17 @@ def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: Sea
 STRANGER_OUTCOMES = ("not_grouped", "own_group", "other_person_group", "unlabelled_group")
 
 
+def led_by_newcomer(item: dict) -> bool:
+    """A wrong placement whose group holds more of the newcomer's kept faces than of any labelled person.
+
+    "other_person_group" uses the labelled faces only. A group made mostly of
+    the newcomer's own faces from other folders' group photos (unlabelled) and
+    a few labelled faces of someone else is then counted as that person's
+    group, although the error is those few faces, not the newcomer's.
+    """
+    return item["same_person_faces"] > max(item.get("labelled_others", {}).values(), default=0)
+
+
 def _quantiles(values: list[float]) -> dict:
     data = np.asarray([value for value in values if value is not None and math.isfinite(value)], np.float64)
     if not data.size:
@@ -977,6 +988,11 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
         report["keep"][str(size)] = {**_outcome_rates(counts),
                                      "wrong_by_attach": sum(1 for item in details if item["attached"]),
                                      "wrong_in_new_groups": sum(1 for item in details if item["from_leftovers"]),
+                                     "other_person_group_led_by_newcomer": sum(
+                                         1 for item in details if item["outcome"] == "other_person_group" and led_by_newcomer(item)),
+                                     "in_group_led_by_another_person_rate": _ratio(
+                                         sum(1 for item in details if item["outcome"] == "other_person_group" and not led_by_newcomer(item)),
+                                         sum(counts.values())),
                                      "unlabelled_group_likely_same_person": sum(
                                          1 for item in details if item["outcome"] == "unlabelled_group"
                                          and item["unlabelled_likely_same_person"] * 2 > item["unlabelled_others"]),

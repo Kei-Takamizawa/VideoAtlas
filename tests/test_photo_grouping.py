@@ -905,3 +905,20 @@ def test_attach_to_new_groups_in_the_newcomer_test_and_the_sweep():
     assert rows[2]["leftover_attach"] is True and rows[2]["missing_rate"] < rows[1]["missing_rate"]
     assert rows[2]["mixed_faces"] == 0
     assert leftover_setting((5, 2)) == (5.0, 2, None, False)
+
+
+def test_a_group_made_mostly_of_the_newcomer_is_not_counted_as_another_persons():
+    from videoatlas.photo_evaluation import led_by_newcomer, stranger_test
+    assert led_by_newcomer({"same_person_faces": 28, "labelled_others": {"Juun": 2, "Stella": 2}})
+    assert not led_by_newcomer({"same_person_faces": 1, "labelled_others": {"Juun": 2}})
+    assert not led_by_newcomer({"same_person_faces": 3, "labelled_others": {"Yuha": 3}})
+    assert led_by_newcomer({"same_person_faces": 1, "labelled_others": {}})
+    generator = np.random.default_rng(3)
+    centers = unit(generator.normal(size=(4, 32)))
+    labels = [person for person in "ABCD" for _ in range(12)]
+    vectors = np.concatenate([centers[index] + 0.25 * generator.normal(size=(12, 32)) for index in range(4)])
+    run = make_run([1] * 48, vectors, labels=labels)
+    loose = GroupingPolicy(("m",), merge_threshold=.3, attach_threshold=-1.0, attach_margin=0.0)
+    entry = stranger_test(run, loose, ["A"], keep_sizes=(1,), repeats=3, batch=1, seed=1)["keep"]["1"]
+    assert entry["other_person_group"] == 3 and entry["other_person_group_led_by_newcomer"] == 0
+    assert entry["in_group_led_by_another_person_rate"] == 1.0

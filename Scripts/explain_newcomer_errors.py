@@ -34,7 +34,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from videoatlas.photo_evaluation import LikelyPerson, _known_label, _subset, face_labels  # noqa: E402
+from videoatlas.photo_evaluation import LikelyPerson, _known_label, _subset, face_labels, led_by_newcomer  # noqa: E402
 from videoatlas.photo_grouping import UNGROUPED, GroupingPolicy, group_faces  # noqa: E402
 from videoatlas.photos import load_run  # noqa: E402
 
@@ -58,11 +58,18 @@ def explain_strangers(path: Path, keep: list[str] | None) -> None:
         for item in entry["wrong"]:
             if item["outcome"] == "other_person_group":
                 rows[(item["person"], item["group_majority"])].append(item)
-        print(f"keep {size}: newcomer | receiving group (majority) | faces | attached | median group size | "
+        other = [item for item in entry["wrong"] if item["outcome"] == "other_person_group"]
+        led = sum(1 for item in other if led_by_newcomer(item))
+        kept = entry["kept_faces"]
+        print(f"keep {size}: kept faces {kept}; in another person's group by labelled faces {len(other)} "
+              f"({100 * len(other) / kept:.1f}%), of them in a group with more of the newcomer's kept faces than of any "
+              f"labelled person {led}; left in a group led by another person {len(other) - led} ({100 * (len(other) - led) / kept:.1f}%)")
+        print(f"keep {size}: newcomer | receiving group (labelled majority) | faces | led by newcomer | attached | median group size | "
               "median unlabelled faces in the group | median of them likely the newcomer | median mean ratio | "
               "median best score | median lead")
         for (person, majority), items in sorted(rows.items(), key=lambda pair: -len(pair[1])):
-            print(f"  {person} | {majority} | {len(items)} | {sum(item['attached'] for item in items)} | "
+            print(f"  {person} | {majority} | {len(items)} | {sum(led_by_newcomer(item) for item in items)} | "
+                  f"{sum(item['attached'] for item in items)} | "
                   f"{_median([item['group_size'] for item in items])} | {_median([item.get('unlabelled_others') for item in items])} | "
                   f"{_median([item.get('unlabelled_likely_same_person') for item in items])} | "
                   f"{_median([item.get('mean_ratio') for item in items])} | {_median([item.get('best_other_group_score') for item in items])} | "
