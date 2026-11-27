@@ -31,7 +31,8 @@ CONTENT_SECURITY_POLICY = ("default-src 'none'; script-src 'self'; style-src 'se
 SECURITY_HEADERS = {
     "Content-Security-Policy": CONTENT_SECURITY_POLICY,
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    # "no-referrer" would make browsers send "Origin: null" on form posts, which the same-origin check refuses.
+    "Referrer-Policy": "same-origin",
     "X-Frame-Options": "DENY",
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",

@@ -100,6 +100,19 @@ def test_post_with_wrong_csrf_rejected(client, app):
     assert response.status_code == 403
 
 
+def test_post_with_own_origin_accepted(client, app):
+    token = login(client, app)
+    response = client.post("/jobs/doctor", headers={"X-CSRF-Token": token, "Origin": "http://localhost",
+                                                    "Sec-Fetch-Site": "same-origin"}, follow_redirects=False)
+    assert response.status_code == 303
+
+
+def test_null_origin_rejected(client, app):
+    token = login(client, app)
+    response = client.post("/jobs/doctor", headers={"X-CSRF-Token": token, "Origin": "null"}, follow_redirects=False)
+    assert response.status_code == 403
+
+
 def test_post_with_foreign_origin_rejected(client, app):
     token = login(client, app)
     response = client.post("/jobs/doctor", headers={"X-CSRF-Token": token, "Origin": "http://evil.example"},
@@ -122,7 +135,7 @@ def test_security_headers(client):
     assert "frame-ancestors 'none'" in csp
     assert "default-src 'none'" in csp
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "same-origin"
     assert response.headers["cache-control"] == "no-store"
 
 
