@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -205,12 +206,22 @@ class JobRunner:
         self._record = True
         self._thread: threading.Thread | None = None
         self._process: subprocess.Popen | None = None
-        store.mark_interrupted()
+        self._lock: int | None = None
 
     def start(self) -> None:
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._loop, name="videoatlas-jobs", daemon=True)
-            self._thread.start()
+        """Take the data folder's runner lock, mark jobs left running by a crash, and start."""
+        if self._thread is not None:
+            return
+        descriptor = os.open(self.store.path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            raise RuntimeError("Another VideoAtlas GUI server is already running jobs from this data folder.") from None
+        self._lock = descriptor
+        self.store.mark_interrupted()
+        self._thread = threading.Thread(target=self._loop, name="videoatlas-jobs", daemon=True)
+        self._thread.start()
 
     def close(self, timeout: float = TERMINATE_GRACE_SECONDS + 5, record: bool = True) -> None:
         """Stop the runner and any running child. record=False leaves the database as a crash would."""
@@ -218,6 +229,9 @@ class JobRunner:
         self._closing.set()
         if self._thread is not None:
             self._thread.join(timeout)
+        if self._lock is not None:
+            os.close(self._lock)
+            self._lock = None
 
     def _loop(self) -> None:
         while not self._closing.is_set():

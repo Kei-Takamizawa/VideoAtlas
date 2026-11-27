@@ -146,8 +146,23 @@ def test_close_terminates_child_and_restart_marks_interrupted(store, settings, t
     time.sleep(2)
     assert not marker.exists(), "the child process outlived the runner"
     assert store.get(job_id).status == "running"
-    JobRunner(JobStore(settings.jobs_db, KINDS), settings, KINDS)
+    restarted = JobRunner(JobStore(settings.jobs_db, KINDS), settings, KINDS)
+    assert store.get(job_id).status == "running", "constructing a runner must not touch jobs"
+    restarted.start()
     assert store.get(job_id).status == "interrupted"
+    restarted.close()
+
+
+def test_second_runner_on_same_data_folder_refused(store, settings, runner):
+    job_id = store.enqueue("script", {"code": "import time; time.sleep(1)"})
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and store.get(job_id).status != "running":
+        time.sleep(0.02)
+    second = JobRunner(store, settings, KINDS)
+    with pytest.raises(RuntimeError, match="already running"):
+        second.start()
+    assert store.get(job_id).status == "running", "the refused runner must not mark the other server's job interrupted"
+    wait_for(store, job_id)
 
 
 def test_latest_finished_and_recent(store):

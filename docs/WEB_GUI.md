@@ -58,7 +58,7 @@ To replace the key, run `rotate-key` and restart the server. The running server 
 - Every change needs the session's CSRF token and must come from the GUI's own pages. Requests with another site's `Origin` are refused.
 - Only the Host names `localhost` and `127.0.0.1` are accepted, which blocks DNS rebinding.
 - The pages load no script from the internet. A Content Security Policy allows only the server's own scripts and styles.
-- Jobs run as separate processes, one at a time, so a model crash cannot stop the GUI and two jobs never compete for the GPU. The GPU check always requests the GPU and shows a CPU fallback as a failure.
+- Jobs run as separate processes, one at a time, so a model crash cannot stop the GUI and two jobs never compete for the GPU. A lock file stops a second GUI server from running jobs from the same data folder. The GPU check always requests the GPU and shows a CPU fallback as a failure.
 - The server keeps no access log. Logs never contain the access key, face images, or face embeddings.
 
 ## Where data is kept
