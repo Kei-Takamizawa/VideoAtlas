@@ -195,6 +195,38 @@ def cmd_group(args) -> int:
     return 0
 
 
+def cmd_adapt(args) -> int:
+    """Write WCCN-whitened copies of embeddings, learned from a first grouping of the same run."""
+    from .photo_backend import within_class_whitening
+    from .photo_grouping import GroupingPolicy, group_faces
+    from .photos import EMBEDDING_DIR, load_run
+    policy = GroupingPolicy.from_json(json.loads(Path(args.policy).read_text(encoding="utf-8")))
+    models = args.models or list(policy.models)
+    run = load_run(args.run, sorted(set(models) | set(policy.models)))
+    groups = group_faces(run, policy).labels
+    folder = Path(args.run)
+    report = {"run": str(args.run), "policy": str(args.policy), "models": {}}
+    for model in models:
+        whitening = within_class_whitening(run.embeddings[model], groups, args.min_size, args.shrinkage, center=not args.no_center)
+        name = f"{model}-{args.suffix}"
+        with np.load(folder / EMBEDDING_DIR / f"{model}.npz", allow_pickle=False) as data:
+            sha256 = str(data["sha256"])
+        key = f"{run.keys[model]}|{whitening.info['method']}:{whitening.digest}"
+        target = folder / EMBEDDING_DIR / f"{name}.npz"
+        if target.exists() and not args.overwrite:
+            raise FileExistsError(f"{target} exists; pass --overwrite to replace it")
+        np.savez_compressed(target, face_ids=np.asarray(run.face_ids), vectors=whitening.apply(run.embeddings[model]),
+                            key=np.asarray(key), sha256=np.asarray(sha256))
+        transforms = folder / "transforms"
+        transforms.mkdir(exist_ok=True)
+        np.savez_compressed(transforms / f"{name}.npz", mean=whitening.mean.astype(np.float32), matrix=whitening.matrix.astype(np.float32),
+                            source_key=np.asarray(run.keys[model]), key=np.asarray(key))
+        report["models"][name] = {"source": model, "key": key, **whitening.info}
+    _write_json(folder / f"adapt-{args.suffix}.json", report)
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def add_photo_commands(commands, common) -> None:
     photos = commands.add_parser("photos", help="analyze, measure, calibrate, and group photos by person")
     actions = photos.add_subparsers(dest="photo_command", required=True)
@@ -243,6 +275,17 @@ def add_photo_commands(commands, common) -> None:
     calibrate.add_argument("--max-suggestions", type=int, default=200)
     calibrate.add_argument("--review-threshold", type=float, help="lowest score at which a group is suggested for a review face")
     calibrate.set_defaults(handler=cmd_calibrate)
+
+    adapt = actions.add_parser("adapt", help="whiten embeddings with the within-person spread of a first grouping (no labels used)")
+    adapt.add_argument("run", type=Path)
+    adapt.add_argument("--policy", type=Path, required=True, help="policy for the first grouping")
+    adapt.add_argument("--models", type=_models, help="models to adapt (default: the policy's models)")
+    adapt.add_argument("--suffix", default="wccn", help="new embeddings are written as <model>-<suffix>")
+    adapt.add_argument("--min-size", type=int, default=10, help="smallest group used to estimate the within-person spread")
+    adapt.add_argument("--shrinkage", type=float, default=0.1)
+    adapt.add_argument("--no-center", action="store_true", help="do not subtract the mean embedding first")
+    adapt.add_argument("--overwrite", action="store_true")
+    adapt.set_defaults(handler=cmd_adapt)
 
     identify = actions.add_parser("identify", help="measure matching against a few named example photos per person")
     identify.add_argument("run", type=Path)

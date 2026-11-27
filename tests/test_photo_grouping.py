@@ -515,3 +515,64 @@ def test_two_large_clusters_become_a_suggestion_not_an_automatic_merge():
     assert roomy.labels[0] == roomy.labels[8]
     with pytest.raises(ValueError):
         GroupingPolicy(("m",), 0.5, cluster_auto_max_size=0).validate()
+
+
+def look_alikes(seed=0, per_person=40):
+    """Two similar people: identity differs only along low-variance directions, nuisance is large."""
+    generator = np.random.default_rng(seed)
+    dims = 32
+    base = np.zeros(dims)
+    base[0] = 3.0
+    offset = np.zeros(dims)
+    offset[1] = 0.35  # identity difference, small
+    vectors, labels = [], []
+    for label, center in (("A", base + offset), ("B", base - offset)):
+        for _ in range(per_person):
+            nuisance = np.zeros(dims)
+            nuisance[2:10] = generator.normal(scale=1.0, size=8)  # pose, light: large, shared by both people
+            noise = generator.normal(scale=0.05, size=dims)
+            vectors.append(center + nuisance + noise)
+            labels.append(label)
+    return make_run([1] * len(labels), vectors, labels=labels)
+
+
+def test_within_class_whitening_separates_look_alikes():
+    from videoatlas.photo_backend import within_class_whitening
+    run = look_alikes()
+    labels = np.asarray([0] * 40 + [1] * 40)
+    before = verification_report(run, "m")["auc"]
+    whitening = within_class_whitening(run.embeddings["m"], labels, min_size=10, shrinkage=0.05)
+    run.embeddings["w"] = whitening.apply(run.embeddings["m"])
+    run.keys["w"] = "w:key"
+    after = verification_report(run, "w")["auc"]
+    assert before < .8 and after > .95
+    assert np.allclose(np.linalg.norm(run.embeddings["w"], axis=1), 1, atol=1e-5)
+    assert whitening.info["groups_used"] == 2 and len(whitening.digest) == 16
+    again = within_class_whitening(run.embeddings["m"], labels, min_size=10, shrinkage=0.05)
+    assert again.digest == whitening.digest
+    with pytest.raises(ValueError):
+        within_class_whitening(run.embeddings["m"], np.asarray([0] * 80), min_size=10)
+
+
+def test_adapt_command_writes_a_separate_embedding_space(tmp_path):
+    run_folder = tmp_path / "run"
+    (run_folder / "embeddings").mkdir(parents=True)
+    run = two_looks_and_a_stranger()
+    lines = [json.dumps({**photo, "faces": [{**face, "usable": True} for face in photo["faces"]]}) for photo in run.photos]
+    (run_folder / "faces.jsonl").write_text("\n".join(lines))
+    (run_folder / "report.json").write_text("{}")
+    np.savez_compressed(run_folder / "embeddings" / "m.npz", face_ids=np.asarray(run.face_ids), vectors=run.embeddings["m"],
+                        key=np.asarray("m:key"), sha256=np.asarray("abc"))
+    command = ["photos", "adapt", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--min-size", "5"]
+    (tmp_path / "policy.json").write_text(json.dumps(GroupingPolicy(("m",), merge_threshold=-1.0).to_json()))
+    assert cli.main(command) != 0  # one group only: no within-person spread across people
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    merge = float((similarity[:8, :8][np.triu_indices(8, 1)].mean() + similarity[:8, 8:16].mean()) / 2)
+    (tmp_path / "policy.json").write_text(json.dumps(GroupingPolicy(("m",), merge_threshold=merge).to_json()))
+    assert cli.main(command) == 0
+    adapted = load_run(run_folder, ["m", "m-wccn"])
+    assert adapted.keys["m-wccn"].startswith("m:key|wccn:")
+    assert adapted.embeddings["m-wccn"].shape == run.embeddings["m"].shape
+    assert (run_folder / "transforms" / "m-wccn.npz").is_file() and (run_folder / "adapt-wccn.json").is_file()
+    assert cli.main(command) != 0  # refuses to overwrite
+    assert cli.main(command + ["--overwrite"]) == 0
