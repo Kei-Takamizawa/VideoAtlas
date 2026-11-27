@@ -59,9 +59,9 @@
 
 **Interfaces:**
 - Produces: `Job` dataclass (`id, kind, status, created_at, started_at, finished_at, progress_done, progress_total, result, error, log_tail, stop_requested`); statuses `queued | running | succeeded | failed | stopped | interrupted`.
-- Produces: `JobStore(path: Path)` with `enqueue(kind: str, params: dict | None = None) -> int` (raises `ValueError` for an unknown kind), `enqueue_unique(kind) -> int` (returns the existing queued/running job id when there is one), `get(id) -> Job | None`, `recent(limit=10) -> list[Job]`, `latest_finished(kind) -> Job | None`, `claim_next() -> Job | None`, `set_progress(id, done, total, log_tail)`, `finish(id, status, result=None, error=None)`, `request_stop(id) -> bool`, `mark_interrupted() -> int`.
+- Produces: `JobStore(path: Path, kinds: dict[str, JobKind] = JOB_KINDS)` with `enqueue(kind: str, params: dict | None = None) -> int` (raises `ValueError` for an unknown kind), `enqueue_unique(kind) -> int` (returns the existing queued/running job id when there is one), `get(id) -> Job | None`, `recent(limit=10) -> list[Job]`, `latest_finished(kind) -> Job | None`, `claim_next() -> Job | None`, `set_progress(id, done, total, log_tail)`, `finish(id, status, result=None, error=None)`, `request_stop(id) -> bool`, `mark_interrupted() -> int`.
 - Produces: `JobKind(name: str, title: str, argv: Callable[[dict], list[str]], json_result: bool)`; `JOB_KINDS = {"doctor": JobKind("doctor", "GPU check", lambda p: ["-m", "videoatlas.cli", "doctor", "--device", "cuda"], True)}`.
-- Produces: `JobRunner(store: JobStore, settings: WebSettings, kinds: dict[str, JobKind] = JOB_KINDS, poll_seconds: float = 0.5)` with `start()`, `close(timeout=10)`; it marks interrupted jobs at construction.
+- Produces: `JobRunner(store: JobStore, settings: WebSettings, kinds: dict[str, JobKind] = JOB_KINDS, poll_seconds: float = 0.5)` with `start()`, `close(timeout=15, record=True)` (`record=False` leaves the database as a crash would, for tests); it marks interrupted jobs at construction.
 
 - [ ] **Step 1: Write failing tests** using a test-only `JobKind` whose argv runs `python -c` scripts:
   - `test_jobs_run_one_at_a_time` (two 0.3 s jobs never overlap: second `started_at >= ` first `finished_at`)
