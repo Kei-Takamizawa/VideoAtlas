@@ -86,6 +86,33 @@ Model comparison on the 18 people outside the test set (12,039 single faces, pai
 
 WCCN raised the AUC but not the true-accept rate at a low false-match rate, which is the range that matters for grouping, so it is not used.
 
+## Newcomers with few photos (2026-11-27)
+
+The answer key only holds people with hundreds of photos, so it cannot show what happens to a person who appears in one or a few photos. `photos strangers` removes a batch of five labelled people except one or three of their photos each, groups the rest of the collection unchanged, and counts kept faces that land in a group led by another labelled person.
+
+| Policy | People | 1 photo kept | 3 photos kept |
+| --- | --- | --- | --- |
+| Candidate policy above (attach 0.75) | 18 development | 29 of 54 in another person's group | 83 of 162 |
+| same | 10 test | 11 of 30 (36.7%) | 38 of 90 (42.2%) |
+| New policy (below) | 18 development | 0 of 54 | 0 of 162 |
+| same | 10 test | 1 of 30 (3.3%) | 1 of 90 (1.1%) |
+
+Almost all of these errors came from the attach step: a top-5 score lets a face join a look-alike's group through a few close faces. The new policy adds two things, both chosen on the development people only:
+
+- `attach_min_ratio`: an attached face's mean score to the whole group must reach a share (0.6) of the group's own mean pair score.
+- Calibration estimates, for every setting, the share of each tuning person's faces that the attach step would put into another person's group if that person had no group yet, and keeps settings at or below 1% (`--newcomer-limit 0.01`).
+
+The new policy uses the mirrored-face models (glintr100+flip and LVFace-B+flip, fused): merge 10.5, cluster merge 0.3 with the size cap of 30, attach 4.0 with margin 0.05 and ratio 0.6.
+
+Final check on the 10 test people (never used for any choice before this check):
+
+| Policy | Mixed faces | Missing photos | Hard look-alike photos (26) |
+| --- | --- | --- | --- |
+| Candidate policy above | 3 of 4,987 (0.06%) | 6.95% | 23 own group, 2 review, 1 wrong |
+| New policy | 66 of 4,792 (1.38%) | 5.21% | 22 own group, 4 review, 0 wrong |
+
+All 66 mixed faces are in one group: the ChaeWon group (688 faces) took 49 Serina faces and 17 Wonyoung faces, and no group is led by Serina. Serina's faces did not form a large cluster in the first step, so her small clusters joined the look-alike group one by one, each below the size cap. The development people could not show this, because ChaeWon and Serina were both hidden test people. This is the same kind of failure as the whole-person merge in round 4. A whole-cluster check for the cluster merge (`cluster_min_ratio`) is being tuned on the development people. Because the test people have now been seen, the next test result will be somewhat optimistic; an unbiased estimate needs new labelled people.
+
 ## Limits of this evidence
 
 - 28 people now, 10 of them kept for testing. Confidence intervals over people are still wide, and the chance of meeting a look-alike pair grows with the number of people.
