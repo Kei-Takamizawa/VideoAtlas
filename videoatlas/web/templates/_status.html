@@ -1,0 +1,66 @@
+<section id="status" hx-get="/fragments/status" hx-trigger="{{ 'every 2s' if active else 'every 15s' }}" hx-swap="outerHTML">
+  <div class="cards">
+    <article class="card">
+      <h2>GPU</h2>
+      {% if gpu.state == "ok" %}
+      <p class="badge ok">All models run on the GPU</p>
+      {% elif gpu.state == "cpu" %}
+      <p class="badge warn">Some models run on the CPU</p>
+      {% elif gpu.state == "failed" %}
+      <p class="badge bad">GPU check failed</p>
+      <p class="error">{{ gpu.error }}</p>
+      {% else %}
+      <p class="badge muted">Not checked yet</p>
+      {% endif %}
+      {% if gpu.models %}
+      <table class="compact">
+        <thead><tr><th>Model</th><th>Runs on</th></tr></thead>
+        <tbody>
+          {% for name, provider in gpu.models %}
+          <tr><td>{{ name }}</td><td>{{ provider }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+      {% if gpu.checked %}<p class="muted">Checked {{ gpu.checked }}</p>{% endif %}
+      <form method="post" action="/jobs/doctor" hx-post="/jobs/doctor" hx-target="#status" hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button type="submit">Check GPU</button>
+      </form>
+    </article>
+    <article class="card">
+      <h2>Storage</h2>
+      <p class="big">{{ disk.free_gb }} GB free of {{ disk.total_gb }} GB</p>
+      <p class="muted">Data folder: <code>{{ disk.path }}</code></p>
+    </article>
+  </div>
+  <article class="card">
+    <h2>Jobs</h2>
+    {% if jobs %}
+    <table class="jobs">
+      <thead><tr><th>#</th><th>Job</th><th>Status</th><th>Progress</th><th>Queued</th><th></th></tr></thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td>{{ job.id }}</td>
+          <td>{{ job.title }}</td>
+          <td><span class="status {{ job.status }}">{{ job.status }}</span>{% if job.error %}<div class="error small">{{ job.error }}</div>{% endif %}</td>
+          <td>{% if job.percent is not none %}<progress max="100" value="{{ job.percent }}">{{ job.percent }}%</progress> {{ job.percent }}%{% endif %}</td>
+          <td>{{ job.created }}</td>
+          <td>
+            {% if job.active %}
+            <form method="post" action="/jobs/{{ job.id }}/stop" hx-post="/jobs/{{ job.id }}/stop" hx-target="#status" hx-swap="outerHTML">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <button type="submit" class="secondary">Stop</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">No jobs yet.</p>
+    {% endif %}
+  </article>
+</section>
