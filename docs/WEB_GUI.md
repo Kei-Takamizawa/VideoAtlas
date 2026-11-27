@@ -47,10 +47,10 @@ To keep the GUI's packages out of the analysis environment, install `requirement
 
 2. Open <http://localhost:8765> in your browser.
 
-3. Sign in with the access key. To see it, run this on the server:
+3. Sign in with the access key. To see it, run this on the server. Run it from the repository folder, because Python must find the `videoatlas` package there:
 
    ```bash
-   .venv/bin/python -m videoatlas.web print-key
+   cd ~/videoatlas && .venv/bin/python -m videoatlas.web print-key
    ```
 
 To replace the key, run `rotate-key` and restart the server. The running server accepts the old key until it restarts.
