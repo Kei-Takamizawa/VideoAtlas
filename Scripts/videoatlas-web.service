@@ -6,7 +6,8 @@
 # and the GPU environment in ~/videoatlas/.venv.
 #
 # Setup, updates, and removal: docs/WEB_GUI.md ("Install it as a service").
-# To start it at boot without a login session, an administrator runs once:
+# Without linger, systemd stops this service when the last login session of dev
+# closes, and does not start it at boot. An administrator runs once:
 #   sudo loginctl enable-linger dev
 [Unit]
 Description=VideoAtlas browser GUI (loopback only)

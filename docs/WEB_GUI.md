@@ -34,7 +34,13 @@ Run these commands inside the server container (`videoatlas.incus`, user `dev`).
    systemctl --user status videoatlas-web
    ```
 
-   To keep it running after reboots without a login session, an administrator runs `sudo loginctl enable-linger dev` once.
+4. Keep it running when nobody is logged in. An administrator runs this once:
+
+   ```bash
+   sudo loginctl enable-linger dev
+   ```
+
+   Without it, systemd stops the GUI as soon as your last SSH session to the server closes, and does not start it at boot.
 
 **Update** to the latest `main`:
 
@@ -48,13 +54,13 @@ systemctl --user restart videoatlas-web
 
 Restarting ends all sign-ins, and a job that was running is marked as interrupted.
 
-**Remove** it. The data folder (`~/videoatlas-data`) is kept.
+**Remove** it. The data folder (`~/videoatlas-data`) and the model files are kept.
 
 ```bash
 systemctl --user disable --now videoatlas-web
 rm ~/.config/systemd/user/videoatlas-web.service
 systemctl --user daemon-reload
-git -C ~/videoatlas worktree remove --force ~/videoatlas-app
+git -C ~/videoatlas worktree remove ~/videoatlas-app
 ```
 
 **Run it by hand** for development, from any checkout with the web packages installed:
