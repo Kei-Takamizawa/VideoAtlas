@@ -1,10 +1,10 @@
 """Compare settings for new groups formed from leftover faces.
 
     python Scripts/sweep_leftover_groups.py RUN --policy POLICY --people A,B,... \
-        --thresholds 5,6,7 --min-sizes 2,3 [--known-caps none,0.5] [--policy-leftover 6:2:0.5] \
+        --thresholds 5,6,7 --min-sizes 2,3 [--known-caps none,0.5] [--attach off,on] [--policy-leftover 6:2:0.5:on] \
         [--exclude-people X,Y] [--keep 3,10,30] [--output FILE]
 
-Two measurements for every (threshold, minimum size, known-group score limit) setting:
+Two measurements for every (threshold, minimum size, known-group score limit, attach to new groups) setting:
 
 1. Known people: mixing and missing for ``--people`` on the whole collection,
    with the labels of ``--exclude-people`` hidden.
@@ -46,8 +46,9 @@ def _plain(value):
 
 def _setting(row: dict) -> str:
     if row["leftover_merge_threshold"] is None:
-        return "off | - | -"
-    return f"{row['leftover_merge_threshold']} | {row['leftover_min_size']} | {row['leftover_max_known_score']}"
+        return "off | - | - | -"
+    return (f"{row['leftover_merge_threshold']} | {row['leftover_min_size']} | {row['leftover_max_known_score']} | "
+            f"{'on' if row['leftover_attach'] else 'off'}")
 
 
 def _rates(entry: dict) -> str:
@@ -65,7 +66,9 @@ def main() -> int:
     parser.add_argument("--min-sizes", type=lambda value: [int(item) for item in _names(value)], default=[3])
     parser.add_argument("--known-caps", type=lambda value: [None if item.lower() == "none" else float(item) for item in _names(value)],
                         default=[None], help="known-group score limits; none means no limit")
-    parser.add_argument("--policy-leftover", help="THRESHOLD:MIN_SIZE[:KNOWN_CAP] for the policy's own leftover step")
+    parser.add_argument("--attach", type=lambda value: [item.lower() == "on" for item in _names(value)], default=[False],
+                        help="off, on, or both: let remaining faces join new groups under the attach rules")
+    parser.add_argument("--policy-leftover", help="THRESHOLD:MIN_SIZE[:KNOWN_CAP[:on|off]] for the policy's own leftover step")
     parser.add_argument("--keep", type=lambda value: [int(item) for item in _names(value)], default=[3, 10, 30])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--batch", type=int, default=5)
@@ -77,9 +80,10 @@ def main() -> int:
     if args.policy_leftover:
         parts = args.policy_leftover.split(":")
         policy = replace(policy, leftover_merge_threshold=float(parts[0]), leftover_min_size=int(parts[1]),
-                         leftover_max_known_score=float(parts[2]) if len(parts) > 2 and parts[2].lower() != "none" else None)
+                         leftover_max_known_score=float(parts[2]) if len(parts) > 2 and parts[2].lower() != "none" else None,
+                         leftover_attach=len(parts) > 3 and parts[3].lower() == "on")
         policy.validate()
-    settings = list(product(args.thresholds, args.min_sizes, args.known_caps))
+    settings = list(product(args.thresholds, args.min_sizes, args.known_caps, args.attach))
     run = load_run(args.run, policy.models)
     if args.exclude_people:
         hide_labels(run, args.exclude_people)
@@ -87,7 +91,7 @@ def main() -> int:
               "people": args.people, "excluded_people": args.exclude_people,
               "known_people": leftover_sweep(run, policy, settings, args.people)}
     if args.skip_strangers:
-        print("Known people: threshold | min size | known cap | groups | new groups (faces) | mixed faces (in new groups) | mixing | "
+        print("Known people: threshold | min size | known cap | attach | groups | new groups (faces) | mixed faces (in new groups) | mixing | "
               "missing | in another group of the person | left for review")
         for row in report["known_people"]:
             new = row["leftover_groups"]
@@ -100,7 +104,7 @@ def main() -> int:
         print("One row per setting. Known people: new groups (faces), mixed faces (in new groups), photos in another group "
               "of the person, photos left for review. Newcomers, per photos kept: own group / another person's group / "
               "unlabelled group, in % of kept faces.")
-        print("threshold | min size | known cap | new groups | mixed | other own group | review | "
+        print("threshold | min size | known cap | attach | new groups | mixed | other own group | review | "
               + " | ".join(f"keep {size}" for size in keep))
         grid_rows = {size: {_setting(row): row for row in entry["leftover_grid"]} for size, entry in keep.items()}
         for row in report["known_people"]:

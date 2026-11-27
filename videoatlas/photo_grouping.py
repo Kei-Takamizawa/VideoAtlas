@@ -27,7 +27,10 @@ evaluation on labelled photos chooses them (see ``photo_evaluation``).
    attached to anyone else's. With ``leftover_max_known_score``, a cluster
    that is as close to an existing group as two pieces of one person usually
    are stays in review instead, because it is more likely hard photos of a
-   known person (or a look-alike) than a new person.
+   known person (or a look-alike) than a new person. With
+   ``leftover_attach``, faces still left then get one more attach step with
+   the new groups as targets, under the same rules as step 4 (the margin
+   counts every group), so a new group can grow the way known groups do.
 6. Suggestions: group pairs whose normalized score reaches
    ``suggest_threshold`` are listed for the user to confirm or reject.
 
@@ -83,6 +86,8 @@ class GroupingPolicy:
     # A leftover cluster whose cluster score (cross mean / sqrt(own mean x group
     # mean)) to any existing group reaches this value does not become a group.
     leftover_max_known_score: float | None = None
+    # Let faces that are still left join a new group under the attach rules.
+    leftover_attach: bool = False
     suggest_threshold: float | None = None
     max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
@@ -622,6 +627,60 @@ def add_leftover_groups(labels: np.ndarray, faces: np.ndarray, merges: list[tupl
     return labels, list(range(group_count, group_count + len(big)))
 
 
+def attach_to_new_groups(similarity: np.ndarray, linked, labels: np.ndarray, faces: np.ndarray, new_groups: list[int],
+                         policy: GroupingPolicy) -> tuple[np.ndarray, np.ndarray]:
+    """Attach step for faces still ungrouped, with the new groups from leftovers as the only targets.
+
+    The rules are those of the main attach step: the top-k mean reaches the
+    attach threshold, it leads the best other group (existing groups
+    included) by the margin, and the whole-group mean ratio reaches
+    ``attach_min_ratio``. Scores use the members after the leftover step and
+    are not updated while faces join, so faces cannot chain into a group.
+    ``linked(a, b)`` returns the cannot-link matrix between face lists a and b;
+    two faces of one photo never join one group.
+    """
+    labels = labels.copy()
+    attached = np.zeros(len(labels), bool)
+    remaining = faces[labels[faces] == UNGROUPED]
+    if policy.attach_threshold is None or not new_groups or not len(remaining):
+        return labels, attached
+    group_count = max(new_groups) + 1
+    grouped = np.flatnonzero(labels != UNGROUPED)
+    by_group = grouped[np.argsort(labels[grouped], kind="stable")]
+    members = np.split(by_group, np.cumsum(np.bincount(labels[grouped], minlength=group_count))[:-1])
+    rows = np.asarray(similarity[remaining], np.float32)
+    scores = np.stack([top_k_means(rows, group, policy.attach_top_k) for group in members], axis=1)
+    del rows
+    scores[np.stack([linked(group, remaining).any(axis=0) for group in members], axis=1)] = -math.inf
+    if group_count > 1:
+        top_two = np.partition(scores, -2, axis=1)[:, -2:]
+        best_scores, second_scores = top_two[:, 1], top_two[:, 0]
+    else:
+        best_scores, second_scores = scores[:, 0], np.full(len(remaining), -math.inf)
+    best_groups = np.argmax(scores, axis=1)
+    is_new = np.zeros(group_count, bool)
+    is_new[new_groups] = True
+    with np.errstate(invalid="ignore"):
+        lead = best_scores - second_scores
+    eligible = is_new[best_groups] & (best_scores >= policy.attach_threshold) & (lead >= policy.attach_margin)
+    if policy.attach_min_ratio is not None and eligible.any():
+        candidates = np.flatnonzero(eligible)
+        targets = sorted({int(group) for group in best_groups[candidates]})
+        column = {group: index for index, group in enumerate(targets)}
+        ratios = mean_ratios(*group_means(similarity, remaining[candidates], [members[group] for group in targets]))
+        chosen = ratios[np.arange(len(candidates)), [column[int(group)] for group in best_groups[candidates]]]
+        eligible[candidates[~(chosen >= policy.attach_min_ratio)]] = False
+    joined: dict[int, list[int]] = {}
+    for position in sorted(np.flatnonzero(eligible), key=lambda item: -float(best_scores[item])):
+        face, group = int(remaining[position]), int(best_groups[position])
+        if group in joined and linked(np.asarray([face]), np.asarray(joined[group])).any():
+            continue
+        labels[face] = group
+        attached[face] = True
+        joined.setdefault(group, []).append(face)
+    return labels, attached
+
+
 def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray, constraints: np.ndarray,
                     rows: np.ndarray, local_labels: np.ndarray, cache: dict | None = None,
                     review_candidates: bool = True) -> GroupingResult:
@@ -687,6 +746,10 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
                                                  policy.leftover_min_size, group_count, policy.leftover_max_known_score,
                                                  similarity, known)
         group_count += len(new_groups)
+        if policy.leftover_attach:
+            labels, joined = attach_to_new_groups(similarity, lambda left, right: constraints[np.ix_(left, right)], labels,
+                                                  pool, new_groups, policy)
+            attached |= joined
     remaining = np.flatnonzero(labels[leftovers] == UNGROUPED)
     # Review candidates come from the groups formed before the attach step only.
     candidates: list[list[dict]] = [[] for _ in remaining]

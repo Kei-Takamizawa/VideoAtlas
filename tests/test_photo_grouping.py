@@ -856,3 +856,52 @@ def test_stranger_test_explains_groups_of_unlabelled_faces():
     assert grid[0]["unlabelled_group"] == 4 and grid[1]["leftover_max_known_score"] == -1.0
     rows = leftover_sweep(run, policy, [(middle, 2, None), (middle, 2, -1.0)], people=["B"])
     assert rows[1]["leftover_max_known_score"] is None and rows[2]["leftover_max_known_score"] == -1.0
+
+
+def test_new_groups_grow_by_the_attach_rules():
+    from videoatlas.photo_grouping import finish_grouping
+    count = 23
+    similarity = np.zeros((count, count), np.float32)
+    known_a, known_b, seed, extra = np.arange(0, 10), np.arange(17, 22), np.arange(10, 12), np.arange(12, 16)
+    similarity[np.ix_(known_a, known_a)] = similarity[np.ix_(known_b, known_b)] = .8
+    similarity[np.ix_(seed, seed)] = .9
+    similarity[np.ix_(extra, seed)] = similarity[np.ix_(seed, extra)] = .7
+    similarity[np.ix_(extra, extra)] = .5
+    similarity[np.ix_(extra, known_a)] = similarity[np.ix_(known_a, extra)] = .1
+    similarity[16, known_a] = similarity[known_a, 16] = .62      # between two groups: no clear lead
+    similarity[16, known_b] = similarity[known_b, 16] = .6
+    similarity[16, seed] = similarity[seed, 16] = .63
+    np.fill_diagonal(similarity, 1.0)
+    run = make_run([1] * 12 + [2] + [1] * 9, np.eye(count))      # faces 12 and 13 share one photo
+    constraints = same_photo_constraints(run.face_photo)
+    local = np.asarray([0] * 10 + list(range(2, 9)) + [1] * 5 + [9])
+    policy = GroupingPolicy(("m",), merge_threshold=.7, attach_threshold=.6, attach_margin=.05, attach_min_ratio=.6,
+                            leftover_merge_threshold=.85, leftover_min_size=2)
+    plain = finish_grouping(run, policy, similarity, constraints, np.arange(count), local)
+    assert plain.leftover_groups == [2] and sorted(np.flatnonzero(plain.labels == 2)) == [10, 11]
+    grown = finish_grouping(run, replace(policy, leftover_attach=True), similarity, constraints, np.arange(count), local)
+    assert sorted(np.flatnonzero(grown.labels == 2)) == [10, 11, 12, 14, 15]
+    assert grown.labels[13] == grown.labels[16] == grown.labels[22] == UNGROUPED
+    assert grown.attached[[12, 14, 15]].all() and not grown.attached[[10, 11, 13, 16]].any()
+    assert grown.group_sizes == [10, 5, 5]
+    assert GroupingPolicy.from_json(replace(policy, leftover_attach=True).to_json()).leftover_attach is True
+
+
+def test_attach_to_new_groups_in_the_newcomer_test_and_the_sweep():
+    from videoatlas.photo_evaluation import leftover_setting, leftover_sweep, stranger_test
+    run, middle = four_separate_people()
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    labels = np.asarray([person for person in "ABCD" for _ in range(12)])
+    same = (labels[:, None] == labels[None, :]) & ~np.eye(48, dtype=bool)
+    seed = float(np.quantile(similarity[same], .7))               # only the closer pairs start a group
+    policy = GroupingPolicy(("m",), merge_threshold=.99, attach_threshold=.45, attach_margin=.05, attach_min_ratio=.6)
+    grid = stranger_test(run, policy, ["A", "B"], keep_sizes=(6,), repeats=2, batch=2, seed=0,
+                         leftover_grid=[(seed, 2), (seed, 2, None, True)])["keep"]["6"]["leftover_grid"]
+    for row in grid:
+        assert sum(row[name] for name in ("not_grouped", "own_group", "other_person_group", "unlabelled_group")) == 24
+    assert grid[1]["leftover_attach"] is True and grid[1]["own_group"] > grid[0]["own_group"]
+    assert grid[1]["wrong_rate"] == 0
+    rows = leftover_sweep(run, policy, [(seed, 2), (seed, 2, None, True)], people=list("ABCD"))
+    assert rows[2]["leftover_attach"] is True and rows[2]["missing_rate"] < rows[1]["missing_rate"]
+    assert rows[2]["mixed_faces"] == 0
+    assert leftover_setting((5, 2)) == (5.0, 2, None, False)
