@@ -111,7 +111,7 @@ Final check on the 10 test people (never used for any choice before this check):
 | Candidate policy above | 3 of 4,987 (0.06%) | 6.95% | 23 own group, 2 review, 1 wrong |
 | New policy | 66 of 4,792 (1.38%) | 5.21% | 22 own group, 4 review, 0 wrong |
 
-All 66 mixed faces are in one group: the ChaeWon group (688 faces) took 49 Serina faces and 17 Wonyoung faces, and no group is led by Serina. Serina's faces did not form a large cluster in the first step, so her small clusters joined the look-alike group one by one, each below the size cap. The development people could not show this, because ChaeWon and Serina were both hidden test people. This is the same kind of failure as the whole-person merge in round 4. A whole-cluster check for the cluster merge (`cluster_min_ratio`) is being tuned on the development people. Because the test people have now been seen, the next test result will be somewhat optimistic; an unbiased estimate needs new labelled people.
+All 66 mixed faces are in one group: the ChaeWon group (688 faces) took 49 Serina faces and 17 Wonyoung faces, and no group is led by Serina. Serina's faces did not form a large cluster in the first step, so those small clusters joined the look-alike group one by one, each below the size cap. The development people could not show this, because ChaeWon and Serina were both hidden test people. This is the same kind of failure as the whole-person merge in round 4. A whole-cluster check for the cluster merge (`cluster_min_ratio`) is being tuned on the development people. Because the test people have now been seen, the next test result will be somewhat optimistic; an unbiased estimate needs new labelled people.
 
 ## Limits of this evidence
 
