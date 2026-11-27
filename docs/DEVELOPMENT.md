@@ -24,6 +24,7 @@ For each task, identify the relevant requirements and code, implement the reques
 | `videoatlas/grouping.py` | Conservative identity comparisons and grouping |
 | `videoatlas/storage.py` | SQLite index, caches, and durable reviewed decisions |
 | `videoatlas/evaluation.py` | Reviewed-pair evaluation and candidate tuning |
+| `videoatlas/web/` | Browser GUI: loopback-only FastAPI server, access key and sessions, job runner, templates, vendored htmx |
 | `Scripts/` | Windows setup, model provisioning, and offline evaluation tools |
 | `tests/` | Automated regression and optional genuine-model checks |
 
@@ -80,6 +81,18 @@ Headless commands:
 `doctor` loads the models and reports the ONNX Runtime providers that each model registered. `images` detects, aligns, and embeds every face in a photo folder, then writes `faces.jsonl`, `embeddings.npz`, and `report.json` to a new output folder, which must be outside the photo folder. When the photo folder has one subfolder per person, the folder names serve only as an offline answer key for a single-image pair evaluation after inference.
 
 GPU use is explicit. `--device cuda` is the default and stops with an error when any model cannot run on the GPU. `--device auto` permits a CPU fallback and logs a warning. `--device cpu` uses the CPU only. The same rule applies to the `acceleration` setting everywhere: `cuda` and `tensorrt` now fail instead of falling back to the CPU, and `auto` logs any fallback. TensorRT loading remains Windows-only. The check covers which providers a session registered; ONNX Runtime may still place individual unsupported operators on the CPU inside a CUDA session.
+
+## Browser GUI
+
+The browser GUI lives in `videoatlas/web/` and runs on the Linux server. See the [browser GUI guide](WEB_GUI.md) for starting it, the SSH tunnel, and its security model. It needs only the hash-pinned packages in `requirements-web.txt`, so its tests run without models, GPU, or Qt:
+
+```bash
+uv pip install --python .venv/bin/python --require-hashes -r requirements-web.txt
+uv pip install --python .venv/bin/python pytest httpx
+.venv/bin/python -m pytest -q tests/test_web_*.py
+```
+
+The web package never imports the analysis engine. It starts work as `python -m videoatlas.cli ...` subprocesses, one at a time, through the job runner in `videoatlas/web/jobs.py`. Add a new kind of job to `JOB_KINDS` with a fixed argument list; never build a shell command from user input. When you add or update a web dependency, pin a release that is at least 14 days old and regenerate `requirements-web.txt` with hashes from `requirements-web.in`.
 
 ## Current implementation context
 

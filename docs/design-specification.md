@@ -24,6 +24,8 @@ When an automatic decision is ambiguous, do not force a merge. Mark it as pendin
 - **GUI:** PySide6.
 - **GPU:** Prefer an NVIDIA GPU when available. Support CPU execution when a GPU is unavailable.
 
+> Amended on November 27, 2026: see [Amendment: Linux server and browser GUI](#amendment-linux-server-and-browser-gui).
+
 ## 3. Core technology
 
 ### Main language
@@ -327,6 +329,8 @@ The main screen contains:
 - **Center:** Selected person's representative faces.
 - **Right:** Videos featuring the selected person.
 - **Bottom:** Analysis status and progress.
+
+> Amended on November 27, 2026: see [Amendment: Linux server and browser GUI](#amendment-linux-server-and-browser-gui).
 
 ## 24. Person list
 
@@ -637,3 +641,16 @@ These notes identify decisions that the supplied design leaves open; they do not
 - **Thresholds and score definitions remain open.** Define score ranges, similarity versus distance, match-rate denominators, ensemble calibration, and minimum evidence before choosing automatic merge thresholds. Do not turn example numbers into validated guarantees.
 - **Evaluation terminology must be precise.** A false-positive count is FP. The false-positive rate is `FP / (FP + TN)`; the fraction of predicted matches that are wrong is `FP / (TP + FP)`. Report the denominator and evaluation unit, such as track pairs or person merges. The source's priority is preventing different people from being merged; it supplies no numeric acceptance target or minimum reviewed sample count.
 - **Persistence details remain open.** Section 28 is a logical entity and field list. Concrete types, keys, indexes, migrations, and retention of confirmed relations through person merges and splits must be specified during implementation.
+
+---
+
+## Amendment: Linux server and browser GUI
+
+Proposed with the browser GUI design that the user approved on November 27, 2026; it takes effect when the user merges it. This amendment changes Sections 2 and 23 as stated below and leaves every other section unchanged.
+
+- **Where processing runs.** Analysis runs on a Linux server with an NVIDIA GPU, inside an isolated container. Windows is no longer the primary platform.
+- **GUI.** The primary interface is a browser GUI served by the server. The server listens on a loopback address only and is reached from the user's computer through an SSH tunnel; it opens no new network port. Pages require an access key, and changes require a CSRF token from a same-origin page.
+- **PySide6 GUI.** The PySide6 desktop GUI is frozen. It will be removed when the browser GUI provides the same functions.
+- **GPU use.** GPU checks and GUI-started analysis request the GPU explicitly. A CPU fallback is shown to the user as a failure or warning; it never happens silently.
+- **Use.** Personal use only remains unchanged.
+- **Layout.** Section 23's regions (person list, representative faces, videos, analysis status) describe content the browser GUI must provide. Their placement may follow the browser layout instead of fixed left, center, right, and bottom panes.
