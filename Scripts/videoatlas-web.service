@@ -1,18 +1,21 @@
 # systemd user unit for the VideoAtlas browser GUI.
-# Install inside the server container (user dev):
-#   mkdir -p ~/.config/systemd/user
-#   cp Scripts/videoatlas-web.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now videoatlas-web
-# To start it at boot without a login session, an administrator runs once:
+#
+# The GUI runs from its own checkout, ~/videoatlas-app, which stays on a released
+# commit. Switching branches in the development checkout (~/videoatlas) cannot
+# change or stop the running GUI. Analysis jobs use the code in ~/videoatlas-app
+# and the GPU environment in ~/videoatlas/.venv.
+#
+# Setup, updates, and removal: docs/WEB_GUI.md ("Install it as a service").
+# Without linger, systemd stops this service when the last login session of dev
+# closes, and does not start it at boot. An administrator runs once:
 #   sudo loginctl enable-linger dev
 [Unit]
 Description=VideoAtlas browser GUI (loopback only)
 
 [Service]
 Type=simple
-WorkingDirectory=%h/videoatlas
-ExecStart=%h/videoatlas/.venv/bin/python -m videoatlas.web serve
+WorkingDirectory=%h/videoatlas-app
+ExecStart=%h/videoatlas-app/.venv-web/bin/python -m videoatlas.web serve --engine-python %h/videoatlas/.venv/bin/python --engine-root %h/videoatlas-app
 Restart=on-failure
 RestartSec=5
 UMask=0077
