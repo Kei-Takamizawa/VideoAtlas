@@ -80,6 +80,15 @@ The actual three-size production detector plus deduplication was then re-evaluat
 
 The offline ablation separately measures detection after applying opaque digital masks, accepted samples, pair scores, held-out threshold performance, visible upper-area appearance, and eye-gap shooting scale. Hair/ear-area colour, coarse texture, and apparent size are exploratory context cues; they are not stable identity embeddings or automatic-merge authority. Real masks can have different shapes, texture, lighting effects, and detector behavior; [NIST's digital-mask study](https://nvlpubs.nist.gov/nistpubs/ir/2020/NIST.IR.8311.pdf) also identifies these simulation limits.
 
+## Browser GUI (stage 1)
+
+Checked on November 27, 2026 UTC in a cloud development container without a GPU or models. Stage 1 adds a loopback-only browser GUI (`videoatlas/web/`, see the [browser GUI guide](WEB_GUI.md)): access-key sign-in, sessions, CSRF and same-origin checks, Host checks, a strict Content Security Policy, a job runner that starts CLI subprocesses one at a time, and a home page with the GPU check, free disk space, and jobs.
+
+- Web tests: **74 passed** (`.venv/bin/python -m pytest -q tests/test_web_*.py`, Python 3.12, hash-pinned `requirements-web.txt`).
+- Chromium end-to-end check: a wrong key was refused; sign-in worked; **Check GPU** ran the real `python -m videoatlas.cli doctor --device cuda` subprocess, and the page showed the failure, because that container has no analysis dependencies. No browser console errors other than the expected 401 for the wrong key. This check found and fixed one defect: `Referrer-Policy: no-referrer` made browsers send `Origin: null` on form posts, which the same-origin check refused.
+- Server container check on November 27, 2026 (RTX 4060 Ti, commit `1252bd6`, separate web environment with `--engine-python ~/videoatlas/.venv/bin/python --engine-root ~/videoatlas`): the server listened only on `127.0.0.1:8765`. Through an SSH tunnel from the Mac, using curl: an unauthenticated `GET /` returned 303 to `/login`; sign-in returned 303 with a `va_session` cookie marked `HttpOnly`, `SameSite=strict`, `Max-Age=604800`; **Check GPU** succeeded with `face01` and `scrfd` on `CUDAExecutionProvider` and the page showed "All models run on the GPU"; a POST without the CSRF token returned 403 and added no job; `Host: evil.example` returned 400. The temporary worktree, environment, and data folder were removed afterwards.
+- Not yet checked: the systemd unit, and the pages in a browser on the Mac (the server check used curl). The engine test suite was not rerun because no engine module changed.
+
 ## Model provenance
 
 | Artifact | Pinned source | Observed size / SHA-256 |
