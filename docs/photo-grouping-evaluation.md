@@ -166,7 +166,7 @@ The newcomer test on the 14 unused people shows a problem that the development p
 | Without new groups (own / another person's / unlabelled, %) | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 1.0 / 11.7 / 6.9 | 3.5 / 14.9 / 8.6 |
 | Setting A | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 5.7 / 11.7 / 6.9 | 14.7 / 14.9 / 8.6 |
 
-Setting A works as intended: no wrong placement was in a new group, and the newcomers' own-group share at 30 photos rose from 3.5% to 14.7%. But 12% to 17% of a newcomer's faces were attached to another person's group, mostly the Juun and Yuha groups, against under 1% on the development people and 1% to 3% on the earlier test people. Several of the 14 belong to the same group of performers as each other and as three development people, and they appear in each other's group photos. The cause is being examined; after that, these 14 people are no longer unseen, and another unbiased check needs new labelled people.
+Setting A works as intended: no wrong placement was in a new group, and the newcomers' own-group share at 30 photos rose from 3.5% to 14.7%. But 12% to 17% of a newcomer's faces were attached to another person's group, mostly the Juun and Yuha groups, against under 1% on the development people and 1% to 3% on the earlier test people. Several of the 14 share photo files with each other and with three development people (Carmen, JiwooH2H, Yuha), so they appear in each other's group photos. The cause is being examined; after that, these 14 people are no longer unseen, and another unbiased check needs new labelled people.
 
 
 ## Limits of this evidence
