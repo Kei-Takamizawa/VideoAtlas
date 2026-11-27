@@ -90,3 +90,8 @@ def test_session_expires():
     session = store.create()
     time.sleep(0.01)
     assert store.get(session.token) is None
+
+
+def test_settings_reject_missing_engine_python(tmp_path):
+    with pytest.raises(ValueError, match="engine Python"):
+        WebSettings(data_dir=tmp_path, python=str(tmp_path / "missing-python")).validate()

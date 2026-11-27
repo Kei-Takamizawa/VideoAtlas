@@ -34,3 +34,21 @@ def test_serve_starts_uvicorn_on_loopback(tmp_path, monkeypatch):
     assert main(["serve", "--data-dir", str(tmp_path), "--port", "8799"]) == 0
     assert calls == [{"host": "127.0.0.1", "port": 8799, "proxy_headers": False, "server_header": False,
                       "date_header": False, "access_log": False}]
+
+
+def test_serve_passes_engine_paths(tmp_path, monkeypatch):
+    import sys
+    from videoatlas.web.settings import REPO_ROOT
+    apps = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: apps.append(app))
+    assert main(["serve", "--data-dir", str(tmp_path), "--engine-python", sys.executable,
+                 "--engine-root", str(REPO_ROOT)]) == 0
+    settings = apps[0].state.settings
+    assert settings.python == str(__import__("pathlib").Path(sys.executable).absolute())
+    assert settings.repo_root == REPO_ROOT
+
+
+def test_serve_rejects_engine_root_without_cli(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    assert main(["serve", "--data-dir", str(tmp_path), "--engine-root", str(tmp_path)]) == 2
+    assert "videoatlas/cli.py" in capsys.readouterr().err

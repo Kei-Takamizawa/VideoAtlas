@@ -40,6 +40,10 @@ class WebSettings:
                              "Use an SSH tunnel to reach it from another computer.")
         if not 1024 <= self.port <= 65535:
             raise ValueError(f"The port must be between 1024 and 65535, not {self.port}.")
+        if not (Path(self.python).is_file() and os.access(self.python, os.X_OK)):
+            raise ValueError(f"The engine Python {self.python!r} is not an executable file.")
+        if not (Path(self.repo_root) / "videoatlas" / "cli.py").is_file():
+            raise ValueError(f"The engine folder {str(self.repo_root)!r} has no videoatlas/cli.py.")
 
     @property
     def web_dir(self) -> Path:

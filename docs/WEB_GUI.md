@@ -31,6 +31,12 @@ Run these commands inside the server container (`videoatlas.incus`, user `dev`) 
 
    To keep it running after reboots without a login session, an administrator runs `sudo loginctl enable-linger dev` once.
 
+To keep the GUI's packages out of the analysis environment, install `requirements-web.txt` into a separate environment and tell the server where the analysis runs:
+
+```bash
+.venv-web/bin/python -m videoatlas.web serve --engine-python ~/videoatlas/.venv/bin/python --engine-root ~/videoatlas
+```
+
 ## Open it from your Mac
 
 1. Open a tunnel and leave the terminal window open:
