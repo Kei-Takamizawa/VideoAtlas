@@ -331,8 +331,10 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
     assert len(calibration_b["held_out"]["targets"]["0.0"]["folds"]) == 1
     assert cli.main(["photos", "calibrate", str(run_folder), "--models", "fake", "--output", str(tmp_path / "calibration-c.json"),
                      "--policy-output", str(tmp_path / "policy-c.json"), "--merge-grid", "0.5:0.9:0.2", "--attach-grid", "none",
-                     "--eye-grid", "0", "--targets", "0", "--policy-target", "0", "--exclude-people", "B", "--skip-held-out"]) == 0
+                     "--eye-grid", "0", "--targets", "0", "--policy-target", "0", "--exclude-people", "B", "--skip-held-out",
+                     "--attach-margin-grid", "0.05,0.5", "--attach-ratio-grid", "none,0.5", "--newcomer-limit", "0.1"]) == 0
     assert json.loads((tmp_path / "calibration-c.json").read_text())["held_out"] is None
+    assert json.loads((tmp_path / "calibration-c.json").read_text())["newcomer_limit"] == 0.1
     assert json.loads((tmp_path / "policy-c.json").read_text())["calibration"]["excluded_people"] == ["B"]
     assert cli.main(["photos", "strangers", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--people", "B", "--keep", "1",
                      "--repeats", "2", "--output", str(tmp_path / "strangers.json")]) == 0
@@ -632,3 +634,47 @@ def test_stranger_test_catches_newcomers_absorbed_by_a_loose_attach():
     assert {item["group_majority"] for item in entry["wrong"]} <= {"B", "C", "D"}
     with pytest.raises(ValueError):
         stranger_test(run, strict, ["Nobody"])
+
+
+def test_group_mean_ratio_stops_a_look_alike_that_matches_only_a_few_faces():
+    from videoatlas.photo_grouping import finish_grouping
+    count = 22
+    similarity = np.zeros((count, count), np.float32)
+    first, second = np.arange(0, 5), np.arange(5, 10)
+    similarity[np.ix_(first, first)] = similarity[np.ix_(second, second)] = .8
+    similarity[np.ix_(first, second)] = similarity[np.ix_(second, first)] = .5
+    similarity[10, first] = similarity[first, 10] = .85      # newcomer: close to half of the group only
+    similarity[10, second] = similarity[second, 10] = -.1
+    similarity[11, :10] = similarity[:10, 11] = .6           # an odd photo of the same person
+    other = np.arange(12, 22)
+    similarity[np.ix_(other, other)] = .8
+    np.fill_diagonal(similarity, 1.0)
+    run = make_run([1] * count, np.eye(count))
+    local = np.asarray([0] * 10 + [2, 3] + [1] * 10)
+    constraints = np.zeros((count, count), bool)
+    loose = GroupingPolicy(("m",), merge_threshold=.7, attach_threshold=.5, attach_margin=.05)
+    result = finish_grouping(run, loose, similarity, constraints, np.arange(count), local)
+    assert result.labels[10] == result.labels[0] and result.labels[11] == result.labels[0]
+    strict = replace(loose, attach_min_ratio=.8)
+    result = finish_grouping(run, strict, similarity, constraints, np.arange(count), local)
+    assert result.labels[10] == UNGROUPED and result.labels[11] == result.labels[0]
+    assert GroupingPolicy.from_json(strict.to_json()).attach_min_ratio == .8
+
+
+def test_calibration_estimates_newcomers_and_respects_the_newcomer_limit():
+    from videoatlas.photo_evaluation import evaluate_grid, pick
+    generator = np.random.default_rng(5)
+    base_b = unit(generator.normal(size=(1, 24)))[0]
+    centers = {"A": unit(generator.normal(size=(1, 24)))[0], "B": base_b,
+               "C": unit((base_b + .45 * unit(generator.normal(size=(1, 24)))[0])[None])[0]}
+    labels = [person for person in "ABC" for _ in range(14)]
+    vectors = np.stack([centers[person] + .2 * generator.normal(size=24) for person in labels])
+    run = make_run([1] * len(labels), vectors, labels=labels)
+    base = GroupingPolicy(("m",), merge_threshold=.0, attach_margin=.0)
+    grid = SearchGrid(merge=(.6,), attach=(None, .1, .9), margin=(0.0,), ratio=(None,))
+    table = evaluate_grid(run, base, grid)
+    rates = {policy.attach_threshold: metrics["newcomer"]["rate"] for policy, metrics in table}
+    assert rates[None] == 0 and rates[.1] > .5 and rates[.9] == 0
+    assert all(metrics["newcomer"]["faces"] == 42 for _, metrics in table)
+    chosen, _ = pick(table, 1.0, max_newcomer_rate=.05)
+    assert chosen.attach_threshold in (None, .9)

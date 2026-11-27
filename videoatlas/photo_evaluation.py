@@ -29,7 +29,8 @@ from typing import Iterable
 import numpy as np
 
 from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, agglomerate, apply_cluster_merges, cut, finish_grouping, \
-    fused_similarity, gate_mask, group_faces, merge_clusters, same_photo_constraints, square_block, top_k_means
+    fused_similarity, gate_mask, group_faces, group_means, initial_groups, mean_ratios, merge_clusters, same_photo_constraints, \
+    square_block, top_k_means
 from .photos import RunData
 
 FMR_TARGETS = (1e-2, 1e-3, 1e-4)
@@ -397,11 +398,17 @@ def _subset(run: RunData, rows: np.ndarray) -> RunData:
 
 @dataclass(frozen=True)
 class SearchGrid:
-    """Candidate settings. None in cluster or attach values means the step is off."""
+    """Candidate settings. None in cluster or attach values means the step is off.
+
+    ``margin`` and ``ratio`` apply only when attach is on; an empty margin
+    tuple keeps the base policy's margin, and None in ratio turns that check off.
+    """
     merge: tuple[float, ...]
     attach: tuple[float | None, ...] = (None,)
     eye: tuple[float, ...] = (0.0,)
     cluster: tuple[float | None, ...] = (None,)
+    margin: tuple[float, ...] = ()
+    ratio: tuple[float | None, ...] = (None,)
 
     @property
     def merge_floor(self) -> float:
@@ -416,10 +423,13 @@ class SearchGrid:
 class _Grid:
     """Caches each clustering step so that every grid setting is cheap to evaluate."""
 
-    def __init__(self, run: RunData, base: GroupingPolicy, grid: SearchGrid) -> None:
+    def __init__(self, run: RunData, base: GroupingPolicy, grid: SearchGrid, newcomers_per_person: int = 200) -> None:
         self.run, self.base, self.grid = run, base, grid
         self.similarity = fused_similarity(run.embeddings, base)
         self.constraints = same_photo_constraints(run.face_photo)
+        self.labels = face_labels(run)
+        self.newcomer_faces = newcomer_sample(self.labels, newcomers_per_person)
+        self.newcomer_cache: dict[tuple, dict] = {}
         self.trees: dict[float, tuple[np.ndarray, list]] = {}
         self.cluster_trees: dict[tuple[float, float], tuple[np.ndarray, list]] = {}
         self.cuts: dict[tuple[float, float], np.ndarray] = {}
@@ -469,13 +479,80 @@ class _Grid:
         return finish_grouping(self.run, policy, self.similarity, self.constraints, rows, local, self.attach_scores[key],
                                review_candidates=suggestions)
 
+    def newcomer(self, policy: GroupingPolicy) -> dict:
+        """Share of sampled labelled faces that the attach step would put into another person's group
+        if their own person had no group yet (a stand-in for people seen for the first time)."""
+        key = (policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold)
+        if key not in self.newcomer_cache:
+            self.newcomer_cache = {key: self._newcomer_scores(*key)}  # the grid loops over attach settings last
+        data = self.newcomer_cache[key]
+        accepted = np.zeros(len(data["person"]), bool)
+        if policy.attach_threshold is not None:
+            accepted = data["eligible"] & (data["best"] >= policy.attach_threshold) & (data["lead"] >= policy.attach_margin)
+            if policy.attach_min_ratio is not None:
+                accepted &= data["ratio"] >= policy.attach_min_ratio
+        rates = [float(accepted[data["person"] == person].mean()) for person in np.unique(data["person"])]
+        return {"faces": int(len(accepted)), "accepted": int(accepted.sum()), "rate": _ratio(int(accepted.sum()), len(accepted)),
+                "mean_person_rate": _mean(rates), "max_person_rate": max(rates) if rates else None}
+
+    def _newcomer_scores(self, eye: float, merge: float, cluster: float | None) -> dict:
+        faces = self.newcomer_faces
+        rows, local = self.local_labels(eye, merge, cluster)
+        group_of, members = initial_groups(len(self.run.faces), rows, local, self.base.min_group_size)
+        person = self.labels[faces]
+        _, led_by = _majorities(group_of, self.labels)
+        scores = np.full((len(faces), len(members)), -math.inf)
+        take_k = self.base.attach_top_k
+        for index, group in enumerate(members):
+            block = np.array(self.similarity[np.ix_(faces, group)], np.float64)
+            inside = np.flatnonzero(group_of[faces] == index)
+            if len(inside):  # a face never counts towards its own score
+                block[inside, np.searchsorted(group, faces[inside])] = -math.inf
+            take = min(take_k, len(group))
+            top = np.partition(block, -take, axis=1)[:, -take:]
+            values = top.mean(axis=1)
+            if len(inside) and take == len(group):
+                values[inside] = np.sort(top[inside], axis=1)[:, 1:].mean(axis=1) if take > 1 else -math.inf
+            scores[:, index] = values
+            scores[person == led_by.get(index), index] = -math.inf  # the person's own groups do not exist yet
+        if len(members):
+            order = np.argsort(-scores, axis=1)
+            best_group = order[:, 0]
+            best = scores[np.arange(len(faces)), best_group]
+            second = scores[np.arange(len(faces)), order[:, 1]] if len(members) > 1 else np.full(len(faces), -math.inf)
+            ratios = mean_ratios(*group_means(self.similarity, faces, members))[np.arange(len(faces)), best_group]
+        else:
+            best = second = ratios = np.full(len(faces), -math.inf)
+        with np.errstate(invalid="ignore"):
+            lead = best - second
+        lead[np.isnan(lead)] = -math.inf
+        eligible = np.isin(faces, rows) & np.isfinite(best)
+        return {"person": person.astype(str), "best": best, "lead": lead, "ratio": ratios, "eligible": eligible}
+
     def policies(self):
+        margins = self.grid.margin or (self.base.attach_margin,)
         for eye in self.grid.eye:
             for merge in self.grid.merge:
                 for cluster in self.grid.cluster:
                     for attach in self.grid.attach:
-                        yield replace(self.base, min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
-                                      attach_threshold=attach)
+                        if attach is None:
+                            yield replace(self.base, min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
+                                          attach_threshold=None)
+                            continue
+                        for margin in margins:
+                            for ratio in self.grid.ratio:
+                                yield replace(self.base, min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
+                                              attach_threshold=attach, attach_margin=margin, attach_min_ratio=ratio)
+
+
+def newcomer_sample(labels: np.ndarray, per_person: int, seed: int = 0) -> np.ndarray:
+    """Up to ``per_person`` answer-key faces of each labelled person, so every person weighs about the same."""
+    generator = np.random.default_rng(seed)
+    chosen = []
+    for person in sorted({label for label in labels if label is not None}):
+        rows = np.flatnonzero(labels == person)
+        chosen.append(np.sort(generator.choice(rows, size=min(per_person, len(rows)), replace=False)))
+    return np.sort(np.concatenate(chosen)) if chosen else np.zeros(0, np.int64)
 
 
 def _rates(metrics: dict) -> tuple[float, float]:
@@ -486,41 +563,56 @@ def _rates(metrics: dict) -> tuple[float, float]:
 def _conservative(policy: GroupingPolicy) -> tuple:
     """Tie-breaker: prefer the stricter setting."""
     return (-policy.merge_threshold, -(policy.cluster_merge_threshold if policy.cluster_merge_threshold is not None else math.inf),
-            -(policy.attach_threshold if policy.attach_threshold is not None else math.inf), -policy.min_eye_distance)
+            -(policy.attach_threshold if policy.attach_threshold is not None else math.inf),
+            -(policy.attach_min_ratio if policy.attach_min_ratio is not None else -math.inf), -policy.attach_margin,
+            -policy.min_eye_distance)
 
 
 def evaluate_grid(run: RunData, base: GroupingPolicy, grid: SearchGrid, labels: np.ndarray | None = None) -> list[tuple[GroupingPolicy, dict]]:
     labels = face_labels(run) if labels is None else labels
     photos = photo_labels(run)
     cache = _Grid(run, base, grid)
-    return [(policy, grouping_metrics(run, cache.result(policy, suggestions=False), labels, photos=photos)) for policy in cache.policies()]
+    table = []
+    for policy in cache.policies():
+        metrics = grouping_metrics(run, cache.result(policy, suggestions=False), labels, photos=photos)
+        metrics["newcomer"] = cache.newcomer(policy)
+        table.append((policy, metrics))
+    return table
 
 
-def pick(table: list[tuple[GroupingPolicy, dict]], max_mixing_rate: float) -> tuple[GroupingPolicy | None, dict | None]:
-    """Fewest missing photos among settings within the mixing limit; ties go to the stricter setting."""
-    allowed = [(policy, metrics) for policy, metrics in table if _rates(metrics)[0] <= max_mixing_rate]
+def _newcomer_rate(metrics: dict) -> float:
+    entry = metrics.get("newcomer")
+    return 0.0 if not entry or entry["rate"] is None else entry["rate"]
+
+
+def pick(table: list[tuple[GroupingPolicy, dict]], max_mixing_rate: float,
+         max_newcomer_rate: float | None = None) -> tuple[GroupingPolicy | None, dict | None]:
+    """Fewest missing photos among settings within the mixing limit (and the newcomer limit, if given);
+    ties go to the stricter setting."""
+    allowed = [(policy, metrics) for policy, metrics in table if _rates(metrics)[0] <= max_mixing_rate
+               and (max_newcomer_rate is None or _newcomer_rate(metrics) <= max_newcomer_rate)]
     if not allowed:
         return None, None
     return min(allowed, key=lambda item: (_rates(item[1])[1], _rates(item[1])[0], _conservative(item[0])))
 
 
 def choose_policy(run: RunData, base: GroupingPolicy, grid: SearchGrid, max_mixing_rate: float,
-                  labels: np.ndarray | None = None) -> tuple[GroupingPolicy | None, dict | None, list[dict]]:
+                  labels: np.ndarray | None = None, max_newcomer_rate: float | None = None) -> tuple[GroupingPolicy | None, dict | None, list[dict]]:
     table = evaluate_grid(run, base, grid, labels)
-    policy, metrics = pick(table, max_mixing_rate)
+    policy, metrics = pick(table, max_mixing_rate, max_newcomer_rate)
     return policy, metrics, [table_row(policy_, metrics_) for policy_, metrics_ in table]
 
 
 def table_row(policy: GroupingPolicy, metrics: dict) -> dict:
     mixing, missing = _rates(metrics)
-    return {"min_eye_distance": policy.min_eye_distance, "merge_threshold": policy.merge_threshold,
-            "cluster_merge_threshold": policy.cluster_merge_threshold, "attach_threshold": policy.attach_threshold,
-            "mixing_rate": mixing, "mixed_groups": metrics["mixing"]["mixed_groups"], "missing_rate": missing, "groups": metrics["groups"]}
+    return {**_setting(policy), "mixing_rate": mixing, "mixed_groups": metrics["mixing"]["mixed_groups"], "missing_rate": missing,
+            "newcomer_rate": (metrics.get("newcomer") or {}).get("rate"), "groups": metrics["groups"]}
 
 
 def _setting(policy: GroupingPolicy) -> dict:
     return {"min_eye_distance": policy.min_eye_distance, "merge_threshold": policy.merge_threshold,
-            "cluster_merge_threshold": policy.cluster_merge_threshold, "attach_threshold": policy.attach_threshold}
+            "cluster_merge_threshold": policy.cluster_merge_threshold, "attach_threshold": policy.attach_threshold,
+            "attach_margin": policy.attach_margin, "attach_min_ratio": policy.attach_min_ratio}
 
 
 def _fold_base(run: RunData, base: GroupingPolicy) -> GroupingPolicy:
@@ -545,7 +637,8 @@ def _review_totals(rows: list[dict]) -> list[dict]:
             for budget, counts in sorted(by_budget.items())]
 
 
-def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: SearchGrid, max_mixing_rates: Iterable[float]) -> dict:
+def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: SearchGrid, max_mixing_rates: Iterable[float],
+                                   max_newcomer_rate: float | None = None) -> dict:
     """Choose settings without each person in turn, then measure errors that involve that person.
 
     Every mixing limit in ``max_mixing_rates`` is evaluated from the same grid,
@@ -572,9 +665,9 @@ def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: Sea
         if full is None:
             full, full_key = _Grid(run, fold_base, grid), key
         for target in targets:
-            policy, train_metrics = pick(table, target)
+            policy, train_metrics = pick(table, target, max_newcomer_rate)
             if policy is None:
-                folds[target].append({"held_out": person, "policy": None, "note": "No setting met the mixing limit on the other people."})
+                folds[target].append({"held_out": person, "policy": None, "note": "No setting met the limits on the other people."})
                 continue
             test = grouping_metrics(run, full.result(policy), labels, people=[person], review=True)
             folds[target].append({"held_out": person, "policy": _setting(policy),
@@ -608,6 +701,14 @@ def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: Sea
 # ---------------------------------------------------------------- open-set check
 
 STRANGER_OUTCOMES = ("not_grouped", "own_group", "other_person_group", "unlabelled_group")
+
+
+def _quantiles(values: list[float]) -> dict:
+    data = np.asarray([value for value in values if value is not None and math.isfinite(value)], np.float64)
+    if not data.size:
+        return {}
+    return {**{f"p{int(q * 100):02d}": round(float(np.quantile(data, q)), 4) for q in (.01, .1, .5, .9, .99)},
+            "max": round(float(data.max()), 4), "count": int(data.size)}
 
 
 def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], keep_sizes: Iterable[int] = (1, 3),
@@ -653,7 +754,7 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
               "seed": seed, "attach_threshold": policy.attach_threshold, "keep": {}}
     for size in sizes:
         counts = Counter()
-        details, best_scores = [], []
+        details, best_scores, leads, ratios = [], [], [], []
         for _ in range(repeats):
             order = [focus[index] for index in generator.permutation(len(focus))]
             for start in range(0, len(order), batch):
@@ -675,6 +776,10 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
                 for index, group in enumerate(result.labels):
                     if group != UNGROUPED:
                         members_of[int(group)].append(index)
+                group_ids = sorted(members_of)
+                kept_positions = np.asarray(sorted(own), np.int64)
+                ratio_of = mean_ratios(*group_means(similarity, kept_positions, [np.asarray(members_of[group]) for group in group_ids])) \
+                    if group_ids and len(kept_positions) else None
                 for index, person in own.items():
                     group = int(result.labels[index])
                     others = [] if group == UNGROUPED else [member for member in members_of[group] if own.get(member) != person]
@@ -688,28 +793,35 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
                         outcome = "other_person_group" if majority is not None else "unlabelled_group"
                     counts[outcome] += 1
                     row = similarity[[index]]
-                    scores = [(float(top_k_means(row, np.asarray([member for member in members if member != index]),
-                                                 policy.attach_top_k)[0]), group_index)
-                              for group_index, members in members_of.items()
-                              if any(own.get(member) != person for member in members if member != index)]
-                    best = max(scores) if scores else (None, None)
+                    scores = sorted(((float(top_k_means(row, np.asarray([member for member in members if member != index]),
+                                                        policy.attach_top_k)[0]), group_index)
+                                     for group_index, members in members_of.items()
+                                     if any(own.get(member) != person for member in members if member != index)), reverse=True)
+                    best = scores[0] if scores else (None, None)
+                    lead = ratio = None
                     if best[0] is not None:
                         best_scores.append(best[0])
+                        lead = best[0] - scores[1][0] if len(scores) > 1 else math.inf
+                        ratio = float(ratio_of[int(np.searchsorted(kept_positions, index)), group_ids.index(best[1])])
+                        leads.append(lead)
+                        ratios.append(ratio)
                     if outcome in ("other_person_group", "unlabelled_group"):
                         details.append({"person": person, "outcome": outcome, "group_majority": majority, "group_size": len(members_of[group]),
                                         "attached": bool(result.attached[index]),
-                                        "best_other_group_score": None if best[0] is None else round(best[0], 4)})
+                                        "best_other_group_score": None if best[0] is None else round(best[0], 4),
+                                        "lead": None if lead is None else round(lead, 4),
+                                        "mean_ratio": None if ratio is None else round(ratio, 4)})
                 del similarity, result, sub
         kept_faces = sum(counts.values())
         wrong = counts["other_person_group"] + counts["unlabelled_group"]
         values = np.asarray(best_scores)
-        quantiles = {f"p{int(q * 100):02d}": round(float(np.quantile(values, q)), 4) for q in (.5, .9, .99)} if values.size else {}
-        if values.size:
-            quantiles["max"] = round(float(values.max()), 4)
         report["keep"][str(size)] = {"kept_faces": kept_faces, **{name: counts[name] for name in STRANGER_OUTCOMES},
                                      "wrong_rate": _ratio(wrong, kept_faces),
+                                     "other_person_rate": _ratio(counts["other_person_group"], kept_faces),
                                      "wrong_by_attach": sum(1 for item in details if item["attached"]),
-                                     "best_score_in_another_group": quantiles,
+                                     "best_score_in_another_group": _quantiles(best_scores),
+                                     "lead_over_second_group": _quantiles(leads),
+                                     "mean_ratio_to_best_group": _quantiles(ratios),
                                      "above_attach_threshold": None if policy.attach_threshold is None or not values.size
                                      else _ratio(int(np.sum(values >= policy.attach_threshold)), int(values.size)),
                                      "wrong": details}

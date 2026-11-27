@@ -89,10 +89,12 @@ def main(folder: str, intruders: bool = False) -> int:
             policy, metrics = chosen["policy"], chosen["metrics"]
             if not policy:
                 continue
+            newcomer = metrics.get("newcomer") or {}
             print(f"  all people, limit {pct(float(target))} (optimistic): eye>={policy['min_eye_distance']} merge {policy['merge_threshold']} "
-                  f"cluster {policy['cluster_merge_threshold']} attach {policy['attach_threshold']} | groups {metrics['groups']}, "
+                  f"cluster {policy['cluster_merge_threshold']} attach {policy['attach_threshold']} "
+                  f"margin {policy.get('attach_margin')} ratio {policy.get('attach_min_ratio')} | groups {metrics['groups']}, "
                   f"review faces {metrics['review_faces']}, mixing {pct(metrics['mixing']['mixing_rate'])}, "
-                  f"missing {pct(metrics['missing']['missing_rate'])}")
+                  f"missing {pct(metrics['missing']['missing_rate'])}, newcomer {pct(newcomer.get('rate'))}")
     return 0
 
 

@@ -56,9 +56,39 @@ Chosen on all 8 people at a mixing limit of 0.05% (round 6): fused glintr100 + L
 
 On all 8 people (optimistic, because the same people chose it): 122 groups, the 8 largest match the 8 people; 230 faces left for review in 130 photos; 94 merge suggestions; 1 mixed face (0.03%); missing 2.48% (1.71% without the photos that have no usable face).
 
+## Test on 20 new people (2026-11-27)
+
+The user added 20 labelled people (15,415 files). None of them was used in rounds 1 to 6. The candidate policy above was applied without any change to all 28 people together (20,028 photos read, 24,398 usable faces, 2,788 photos with two or more usable faces). Only errors that involve the 20 new people are counted.
+
+- Before any further tuning, the 20 new people were split at random (SHA-256 of a fixed seed and the name) into 10 development people and 10 test people. The test people are kept out of every choice that follows.
+- Analysis on CUDA with six models (four, plus mirrored-face averaging for two of them): 31 min 12 s (10.7 photos/s), peak GPU memory 5,777 MiB for the whole device. Grouping 24,398 faces: 20 s, 5.9 GiB of RAM.
+
+| People | Labelled faces in groups | Mixed faces | Missing photos | Missing after 200 suggestions |
+| --- | --- | --- | --- | --- |
+| 20 new people | 13,159 | 9 (0.07%) | 6.48% of 15,024 | 4.57% |
+| 10 test people | 4,987 | 3 (0.06%) | 6.95% of 5,684 | 4.52% |
+| All 28 people | 17,002 | 10 (0.06%) | 5.54% of 19,533 | 3.97% |
+
+- Mixing: 8 groups hold faces of two people, each with one or two faces of the other person. No person was merged as a whole.
+- Missing: 832 of the 974 missing photos of the new people are in a second large group of the same person (for example 481 + 142, 635 + 321, 525 + 256 faces). Such pairs are larger than the automatic-merge cap of 30 faces, so they can only become merge suggestions. The review simulation shows that these suggestions are ranked between 100 and 200, behind many suggestions between small groups.
+- The 26 hard photos the user confirmed as correctly filed (look-alike people): 23 are in their own person's main group, 2 are left for review with their own person as the first candidate, and 1 is in another person's group.
+
+Model comparison on the 18 people outside the test set (12,039 single faces, paired person bootstrap, difference in TAR at FMR 1e-3 against glintr100):
+
+| Model | AUC | TAR at FMR 1e-3 | Difference (95% CI) |
+| --- | --- | --- | --- |
+| glintr100 | 0.978 | 72.9% | reference |
+| glintr100 + LVFace-B (fused) | 0.982 | 74.4% | +1.5 (-1.1 to +3.6) |
+| both with mirrored-face averaging, fused | 0.982 | 76.7% | +3.8 (+1.7 to +5.5) |
+| w600k_r50 + both mirrored, fused | 0.982 | 76.8% | +4.0 (+2.1 to +5.3) |
+| both after WCCN, fused | 0.988 | 73.4% | +0.6 (-3.8 to +13.7) |
+| JAPANESE FACE V1 (all 28 people) | 0.760 | 4.7% | – |
+
+WCCN raised the AUC but not the true-accept rate at a low false-match rate, which is the range that matters for grouping, so it is not used.
+
 ## Limits of this evidence
 
-- Only 8 people. Confidence intervals over people are wide, and the chance of meeting a look-alike pair grows with the number of people.
+- 28 people now, 10 of them kept for testing. Confidence intervals over people are still wide, and the chance of meeting a look-alike pair grows with the number of people.
 - The settings grids for rounds 2 to 6 were widened after seeing held-out results. The held-out numbers are therefore somewhat optimistic. An unbiased estimate needs people who were not used in any round.
 - The review simulation assumes that the user answers every suggestion correctly.
 - The candidate models (glintr100, LVFace-B) have non-commercial licences. JAPANESE FACE V1 remains the specified primary model; the user decided to collect more labelled people before changing it.

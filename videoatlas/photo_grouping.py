@@ -46,6 +46,11 @@ class GroupingPolicy:
     merge_threshold: float
     attach_threshold: float | None = None
     attach_margin: float = .05
+    # Open-set safeguard for the attach step: the face's mean score to the whole
+    # group must reach this share of the group's own mean pair score. The top-k
+    # score alone lets a newcomer join a look-alike group through a few close
+    # faces; the whole-group mean does not.
+    attach_min_ratio: float | None = None
     attach_top_k: int = 5
     review_threshold: float | None = None
     min_group_size: int = 2
@@ -86,6 +91,8 @@ class GroupingPolicy:
             raise ValueError("min_group_size must be at least 2 and attach_top_k at least 1")
         if not all(math.isfinite(value) for value in (self.merge_threshold, self.attach_margin, self.min_eye_distance)):
             raise ValueError("thresholds must be finite")
+        if self.attach_min_ratio is not None and not math.isfinite(self.attach_min_ratio):
+            raise ValueError("attach_min_ratio must be finite")
 
     def to_json(self) -> dict:
         return {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(self).items()}
@@ -220,6 +227,49 @@ def cut(merges: Iterable[tuple[int, int, float]], count: int, threshold: float) 
         if left != right:
             parent[max(left, right)] = min(left, right)
     return np.asarray([find(index) for index in range(count)])
+
+
+def group_means(similarity: np.ndarray, faces: np.ndarray, members: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Mean score of each face to each group (leaving the face itself out) and each group's own mean pair score.
+
+    Returns ``(means, within)``: means is faces x groups; within has one value
+    per group (NaN for a single-face group).
+    """
+    faces = np.asarray(faces, np.int64)
+    count = similarity.shape[0]
+    group_of = np.full(count, -1, np.int64)
+    for index, group in enumerate(members):
+        group_of[group] = index
+    sizes = np.asarray([len(group) for group in members], np.float64)
+    member_of = np.zeros((count, len(members)), np.float32)
+    grouped = np.flatnonzero(group_of >= 0)
+    member_of[grouped, group_of[grouped]] = 1.0
+    means = np.zeros((len(faces), len(members)), np.float64)
+    for start in range(0, len(faces), 1024):
+        means[start:start + 1024] = np.asarray(similarity[faces[start:start + 1024]], np.float32) @ member_of
+    del member_of
+    own = group_of[faces]
+    inside = np.flatnonzero(own >= 0)
+    counts = np.broadcast_to(sizes, means.shape).copy()
+    if len(inside):
+        means[inside, own[inside]] -= np.asarray(similarity[faces[inside], faces[inside]], np.float64)
+        counts[inside, own[inside]] -= 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        means = np.where(counts > 0, means / counts, np.nan)
+    within = np.full(len(members), np.nan)
+    for index, group in enumerate(members):
+        if len(group) > 1:
+            block = np.asarray(similarity[np.ix_(group, group)], np.float64)
+            within[index] = (block.sum() - np.trace(block)) / (len(group) * (len(group) - 1))
+    return means, within
+
+
+def mean_ratios(means: np.ndarray, within: np.ndarray) -> np.ndarray:
+    """Face-to-group mean divided by the group's own mean; -inf where the group mean is not positive."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratios = means / within[None, :]
+    ratios[~np.isfinite(ratios) | ~(within[None, :] > 0)] = -math.inf
+    return ratios
 
 
 def top_k_means(similarity_rows: np.ndarray, members: np.ndarray, k: int) -> np.ndarray:
@@ -438,6 +488,24 @@ def group_faces(run: RunData, policy: GroupingPolicy, cannot_link: np.ndarray | 
     return finish_grouping(run, policy, similarity, constraints, rows, local)
 
 
+def initial_groups(count: int, rows: np.ndarray, local_labels: np.ndarray, min_group_size: int) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Group index per face (largest group first) and each group's members, before the attach step."""
+    labels = np.full(count, UNGROUPED, np.int64)
+    if not len(rows):
+        return labels, []
+    unique, inverse, sizes = np.unique(local_labels, return_inverse=True, return_counts=True)
+    order = np.lexsort((unique, -sizes))  # largest first, then by cluster label
+    big = order[sizes[order] >= min_group_size]
+    index_of = np.full(len(unique), UNGROUPED, np.int64)
+    index_of[big] = np.arange(len(big))
+    labels[rows] = index_of[inverse.reshape(-1)]
+    group_count = len(big)
+    grouped = np.flatnonzero(labels != UNGROUPED)
+    by_group = grouped[np.argsort(labels[grouped], kind="stable")]
+    members = np.split(by_group, np.cumsum(np.bincount(labels[grouped], minlength=group_count))[:-1]) if group_count else []
+    return labels, members
+
+
 def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray, constraints: np.ndarray,
                     rows: np.ndarray, local_labels: np.ndarray, cache: dict | None = None,
                     review_candidates: bool = True) -> GroupingResult:
@@ -448,20 +516,11 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
     lists review faces without candidate groups, which is faster.
     """
     count = len(run.faces)
-    labels = np.full(count, UNGROUPED, np.int64)
-    unique, inverse, sizes = np.unique(local_labels, return_inverse=True, return_counts=True)
-    order = np.lexsort((unique, -sizes))  # largest first, then by cluster label
-    big = order[sizes[order] >= policy.min_group_size]
-    index_of = np.full(len(unique), UNGROUPED, np.int64)
-    index_of[big] = np.arange(len(big))
-    labels[rows] = index_of[inverse.reshape(-1)]
-    group_count = len(big)
+    labels, members = initial_groups(count, rows, local_labels, policy.min_group_size)
+    group_count = len(members)
     attached = np.zeros(count, bool)
     gated = np.ones(count, bool)
     gated[rows] = False
-    grouped = np.flatnonzero(labels != UNGROUPED)
-    by_group = grouped[np.argsort(labels[grouped], kind="stable")]
-    members = np.split(by_group, np.cumsum(np.bincount(labels[grouped], minlength=group_count))[:-1]) if group_count else []
     leftovers = np.flatnonzero(labels == UNGROUPED)
     scores = None
     if group_count and len(leftovers):
@@ -486,6 +545,14 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
             with np.errstate(invalid="ignore"):  # -inf minus -inf: no open group, never eligible
                 lead = best_scores - second_scores
             eligible = (~gated[leftovers]) & (best_scores >= policy.attach_threshold) & (lead >= policy.attach_margin)
+            if policy.attach_min_ratio is not None and eligible.any():
+                if cache is not None and "ratios" in cache:
+                    ratios = cache["ratios"]
+                else:
+                    ratios = mean_ratios(*group_means(similarity, leftovers, members))
+                    if cache is not None:
+                        cache["ratios"] = ratios
+                eligible &= ratios[np.arange(len(leftovers)), best_groups] >= policy.attach_min_ratio
             for position in sorted(np.flatnonzero(eligible), key=lambda item: -float(best_scores[item])):
                 face, group = leftovers[position], int(best_groups[position])
                 # Two faces from one photo may both qualify; the stronger one takes the group.

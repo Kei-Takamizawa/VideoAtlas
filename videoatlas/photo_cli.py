@@ -141,35 +141,37 @@ def _brief(metrics: dict | None) -> dict | None:
         return None
     return {**{key: metrics[key] for key in ("groups", "grouped_faces", "attached_faces", "review_faces", "merge_suggestions")},
             "mixing": {key: value for key, value in metrics["mixing"].items() if key != "details"},
-            "missing": metrics["missing"], "people": metrics["people"]}
+            "missing": metrics["missing"], "newcomer": metrics.get("newcomer"), "people": metrics["people"]}
 
 
 def cmd_calibrate(args) -> int:
     from .photo_evaluation import SearchGrid, calibrate_leave_one_person_out, evaluate_grid, pick, table_row
     run = _load(args, args.models)
     base = _base_policy(args, run)
-    grid = SearchGrid(tuple(args.merge_grid), tuple(args.attach_grid), tuple(args.eye_grid), tuple(args.cluster_grid))
+    grid = SearchGrid(tuple(args.merge_grid), tuple(args.attach_grid), tuple(args.eye_grid), tuple(args.cluster_grid),
+                      tuple(args.attach_margin_grid or ()), tuple(args.attach_ratio_grid))
     targets = sorted(set(args.targets) | {args.policy_target})
     started = time.monotonic()
-    held_out = None if args.skip_held_out else calibrate_leave_one_person_out(run, base, grid, targets)
+    held_out = None if args.skip_held_out else calibrate_leave_one_person_out(run, base, grid, targets, args.newcomer_limit)
     table = evaluate_grid(run, base, grid)
     all_people = {}
     for target in targets:
-        policy, metrics = pick(table, target)
+        policy, metrics = pick(table, target, args.newcomer_limit)
         all_people[str(target)] = {"policy": policy.to_json() if policy else None, "metrics": _brief(metrics)}
     result = {"run": str(args.run), "models": args.models, "policy_target": args.policy_target,
-              "excluded_people": args.exclude_people or [],
+              "excluded_people": args.exclude_people or [], "newcomer_limit": args.newcomer_limit,
               "grid": {"merge": grid.merge, "attach": grid.attach, "min_eye_distance": grid.eye, "cluster_merge": grid.cluster,
-                       "settings": len(table)},
+                       "attach_margin": grid.margin or [base.attach_margin], "attach_min_ratio": grid.ratio, "settings": len(table)},
               "held_out": held_out,
               "all_people": {"targets": all_people,
                              "note": "Chosen and measured on the same people: optimistic. Use the held_out numbers as the estimate."},
               "table": [table_row(policy, metrics) for policy, metrics in table],
               "elapsed_seconds": round(time.monotonic() - started, 1)}
-    policy, _ = pick(table, args.policy_target)
+    policy, _ = pick(table, args.policy_target, args.newcomer_limit)
     if policy is not None and args.policy_output:
         calibrated = replace(policy, review_threshold=args.review_threshold,
                              calibration={"run": str(args.run), "max_mixing_rate": args.policy_target,
+                                          "max_newcomer_rate": args.newcomer_limit,
                                           "held_out": held_out["targets"][str(args.policy_target)]["held_out"] if held_out else None,
                                           "excluded_people": args.exclude_people or []})
         _write_json(args.policy_output, calibrated.to_json())
@@ -178,7 +180,7 @@ def cmd_calibrate(args) -> int:
               for target, entry in held_out["targets"].items()} if held_out else None
     chosen = all_people[str(args.policy_target)]["metrics"]
     print(json.dumps({"held_out": digest, "policy": policy.to_json() if policy else None,
-                      "tuning_people": {key: chosen[key] for key in ("mixing", "missing")} if chosen else None},
+                      "tuning_people": {key: chosen[key] for key in ("mixing", "missing", "newcomer")} if chosen else None},
                      indent=2, default=_json_default))
     return 0
 
@@ -312,6 +314,11 @@ def add_photo_commands(commands, common) -> None:
     calibrate.add_argument("--cluster-auto-max-size", type=int,
                            help="largest smaller cluster in an automatic cluster merge; larger pairs only become suggestions")
     calibrate.add_argument("--attach-margin", type=float, default=0.05)
+    calibrate.add_argument("--attach-margin-grid", type=_grid, help="attach margins to try (default: --attach-margin only)")
+    calibrate.add_argument("--attach-ratio-grid", type=_optional_grid, default=[None],
+                           help="minimum share of the group's own mean score for an attached face; none turns the check off")
+    calibrate.add_argument("--newcomer-limit", type=float,
+                           help="largest share of a new person's faces that the attach step may put into another person's group")
     calibrate.add_argument("--top-k", type=int, default=5)
     calibrate.add_argument("--min-group-size", type=int, default=2)
     calibrate.add_argument("--linkage", choices=("average", "complete"), default="average")
