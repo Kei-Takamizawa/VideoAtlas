@@ -113,6 +113,26 @@ Final check on the 10 test people (never used for any choice before this check):
 
 All 66 mixed faces are in one group: the ChaeWon group (688 faces) took 49 Serina faces and 17 Wonyoung faces, and no group is led by Serina. Serina's faces did not form a large cluster in the first step, so those small clusters joined the look-alike group one by one, each below the size cap. The development people could not show this, because ChaeWon and Serina were both hidden test people. This is the same kind of failure as the whole-person merge in round 4. A whole-cluster check for the cluster merge (`cluster_min_ratio`) is being tuned on the development people. Because the test people have now been seen, the next test result will be somewhat optimistic; an unbiased estimate needs new labelled people.
 
+## Whole-cluster check in the cluster merge (2026-11-27)
+
+`cluster_min_ratio` blocks a cluster merge unless the mean score between the two clusters reaches a share of the larger cluster's own mean pair score. A piece of a look-alike person is close to a few faces of the big group, but not to the group as a whole, so its ratio stays low. The value 0.5 was chosen on the development people only (mixing 0.017%, missing 5.09%, newcomer estimate 0.89%).
+
+Second check on the 10 test people. This is the second time these people were looked at, and the failure seen in the first check guided this change, so these numbers are somewhat optimistic:
+
+| Policy | Mixed faces | Missing photos | Newcomers in another person's group (1 / 3 / 10 / 30 photos kept) | Hard look-alike photos (26) |
+| --- | --- | --- | --- | --- |
+| Candidate policy above | 3 of 4,987 (0.06%) | 6.95% | 36.7% / 42.2% / - / - | 23 own group, 2 review, 1 wrong |
+| Attach safeguards only | 66 of 4,792 (1.38%) | 5.21% | 3.3% / 1.1% / - / - | 22 own group, 4 review, 0 wrong |
+| Attach safeguards and `cluster_min_ratio` 0.5 | 1 of 4,877 (0.02%) | 3.20% | 3.3% / 1.1% / 1.3% / 1.6% | 22 own group, 4 review, 0 wrong |
+
+ChaeWon and Serina now lead separate groups, and neither group holds another labelled person. The two merges that caused the earlier mixing (ratios 0.43 and 0.32) are blocked.
+
+One problem remains. A newcomer rarely gets a group of their own: with 30 photos kept, only 6 of 900 kept faces were in a group of their own, and almost all others stayed in review. The first clustering step joins only near-duplicate faces, and the attach step (correctly) keeps newcomers out of other groups.
+
+## New groups from leftover faces (in progress)
+
+An optional step clusters the faces that no group took among themselves, with average linkage at a lower threshold (`leftover_merge_threshold`), and keeps clusters of at least `leftover_min_size` faces as new groups. The groups file marks them with `from_leftovers`, so the user can check them first. `Scripts/sweep_leftover_groups.py` compares settings on the development people: mixing and missing for known people, and the newcomer test with 1, 3, 10 and 30 photos kept. Results will be added here.
+
 ## Limits of this evidence
 
 - 28 people now, 10 of them kept for testing. Confidence intervals over people are still wide, and the chance of meeting a look-alike pair grows with the number of people.
