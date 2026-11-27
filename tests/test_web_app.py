@@ -41,6 +41,18 @@ def test_unknown_host_rejected(client):
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize("host", ["localhost:8765", "127.0.0.1:8765", "[::1]:8765"])
+def test_loopback_hosts_accepted(client, host):
+    assert client.get("/login", headers={"host": host}).status_code == 200
+
+
+def test_post_from_ipv6_loopback_origin_accepted(client, app):
+    token = login(client, app)
+    response = client.post("/jobs/doctor", headers={"host": "[::1]:8765", "Origin": "http://[::1]:8765",
+                                                    "X-CSRF-Token": token}, follow_redirects=False)
+    assert response.status_code == 303
+
+
 def test_home_requires_login(client):
     response = client.get("/", follow_redirects=False)
     assert response.status_code == 303

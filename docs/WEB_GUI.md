@@ -57,12 +57,12 @@ To replace the key, run `rotate-key` and restart the server. The running server 
 
 ## How it is protected
 
-- The server listens on a loopback address. It refuses to start on any other address.
+- The server listens on a loopback address (`127.0.0.1`, `::1`, or `localhost`). It refuses to start on any other address.
 - The SSH tunnel is the only way in, so your SSH key is the first lock.
 - The access key is the second lock. Other programs on your Mac, and web pages open in your browser, can reach the forwarded port, but they do not know the key. The key file is readable only by its owner.
 - A session cookie is sent only to this site (`SameSite=Strict`) and is hidden from scripts (`HttpOnly`). Sessions last up to seven days and end when the server restarts.
 - Every change needs the session's CSRF token and must come from the GUI's own pages. Requests with another site's `Origin` are refused.
-- Only the Host names `localhost` and `127.0.0.1` are accepted, which blocks DNS rebinding.
+- Only the Host names `localhost`, `127.0.0.1`, and `[::1]` are accepted, which blocks DNS rebinding.
 - The pages load no script from the internet. A Content Security Policy allows only the server's own scripts and styles.
 - Jobs run as separate processes, one at a time, so a model crash cannot stop the GUI and two jobs never compete for the GPU. A lock file stops a second GUI server from running jobs from the same data folder. The GPU check always requests the GPU and shows a CPU fallback as a failure.
 - The server keeps no access log. Logs never contain the access key, face images, or face embeddings.

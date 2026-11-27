@@ -19,13 +19,15 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .jobs import JOB_KINDS, Job, JobRunner, JobStore
 from .security import Session, SessionStore, keys_match, load_or_create_key
-from .settings import WebSettings
+from .settings import LOOPBACK_HOSTS, WebSettings
 from .status import ago, disk_summary, gpu_summary, progress_percent
 
 HERE = Path(__file__).resolve().parent
 SESSION_COOKIE = "va_session"
 MAX_FORM_BYTES = 4096
-ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+# Host names a browser may use: the server's own loopback addresses, written as Starlette
+# parses a Host header (an IPv6 address keeps its brackets). An IP literal cannot be rebound by DNS.
+ALLOWED_HOSTS = [f"[{host}]" if ":" in host else host for host in LOOPBACK_HOSTS]
 CONTENT_SECURITY_POLICY = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
                            "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 SECURITY_HEADERS = {

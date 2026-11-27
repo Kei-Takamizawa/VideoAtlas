@@ -11,7 +11,7 @@ def _mode(path):
     return stat.S_IMODE(path.stat().st_mode)
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.5", "example.com", "::"])
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.5", "example.com", "::", "127.0.0.2", "::ffff:127.0.0.1"])
 def test_settings_reject_non_loopback_host(tmp_path, host):
     with pytest.raises(ValueError, match="loopback"):
         WebSettings(data_dir=tmp_path, host=host).validate()
