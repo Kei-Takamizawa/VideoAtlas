@@ -1,6 +1,6 @@
 """Conservative grouping of photo faces into people.
 
-The policy has three steps. All thresholds are uncalibrated until an
+The policy has these steps. All thresholds are uncalibrated until an
 evaluation on labelled photos chooses them (see ``photo_evaluation``).
 
 1. Gate: faces that are too small or turned too far aside never start or join a
@@ -19,7 +19,13 @@ evaluation on labelled photos chooses them (see ``photo_evaluation``).
    similarities to that group's faces reaches the attach threshold, and the best
    group leads the second-best group by a margin. Otherwise it is listed for
    review with its candidate groups.
-5. Suggestions: group pairs whose normalized score reaches
+5. New groups from leftovers (optional): faces that no group took are
+   clustered again among themselves with average linkage at the lower
+   ``leftover_merge_threshold``. Clusters of at least ``leftover_min_size``
+   faces become new groups, marked so the user can check them. A person who
+   appears in only a few photos can get a group this way, without being
+   attached to anyone else's.
+6. Suggestions: group pairs whose normalized score reaches
    ``suggest_threshold`` are listed for the user to confirm or reject.
 
 Several models can be fused only through a per-model affine score normalization
@@ -67,6 +73,10 @@ class GroupingPolicy:
     # clusters must reach this share of the larger cluster's own mean pair
     # score, so small pieces of a look-alike person are not absorbed one by one.
     cluster_min_ratio: float | None = None
+    # New groups from leftovers: average-linkage threshold among the faces that
+    # no group took, and the smallest cluster that becomes a group.
+    leftover_merge_threshold: float | None = None
+    leftover_min_size: int = 3
     suggest_threshold: float | None = None
     max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
@@ -91,11 +101,13 @@ class GroupingPolicy:
             raise ValueError("cluster_auto_max_size must be at least 1")
         if self.cluster_min_size < 2 or self.max_suggestions < 0:
             raise ValueError("cluster_min_size must be at least 2 and max_suggestions not negative")
+        if self.leftover_min_size < 2:
+            raise ValueError("leftover_min_size must be at least 2")
         if self.min_group_size < 2 or self.attach_top_k < 1:
             raise ValueError("min_group_size must be at least 2 and attach_top_k at least 1")
         if not all(math.isfinite(value) for value in (self.merge_threshold, self.attach_margin, self.min_eye_distance)):
             raise ValueError("thresholds must be finite")
-        for name in ("attach_min_ratio", "cluster_min_ratio"):
+        for name in ("attach_min_ratio", "cluster_min_ratio", "leftover_merge_threshold"):
             if getattr(self, name) is not None and not math.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
 
@@ -478,6 +490,7 @@ class GroupingResult:
     gated: np.ndarray                      # True for faces that the gate kept out of automatic grouping
     review: list[dict]                     # faces left for review, with candidate groups
     suggestions: list[dict] = field(default_factory=list)  # group pairs that may be one person
+    leftover_groups: list[int] = field(default_factory=list)  # groups formed from leftover faces
 
 
 def gate_mask(faces: list[dict], policy: GroupingPolicy) -> np.ndarray:
@@ -525,6 +538,35 @@ def initial_groups(count: int, rows: np.ndarray, local_labels: np.ndarray, min_g
     by_group = grouped[np.argsort(labels[grouped], kind="stable")]
     members = np.split(by_group, np.cumsum(np.bincount(labels[grouped], minlength=group_count))[:-1]) if group_count else []
     return labels, members
+
+
+def leftover_merges(similarity: np.ndarray, constraints: np.ndarray, faces: np.ndarray, floor: float,
+                    linkage: str = "average") -> list[tuple[int, int, float]]:
+    """Clustering merges among the given leftover faces, down to ``floor``.
+
+    Merge indexes are positions in ``faces``. Cutting the merges at any
+    threshold at or above ``floor`` gives that threshold's clusters.
+    """
+    if len(faces) < 2:
+        return []
+    block = square_block(similarity, faces)
+    return agglomerate(block, square_block(constraints, faces), linkage, floor, overwrite=block is not similarity)
+
+
+def add_leftover_groups(labels: np.ndarray, faces: np.ndarray, merges: list[tuple[int, int, float]], threshold: float,
+                        min_size: int, group_count: int) -> tuple[np.ndarray, list[int]]:
+    """New group indexes, after ``group_count`` and largest first, for leftover clusters of ``min_size`` or more faces."""
+    labels = labels.copy()
+    if not len(faces):
+        return labels, []
+    local = cut(merges, len(faces), threshold)
+    unique, inverse, sizes = np.unique(local, return_inverse=True, return_counts=True)
+    order = np.lexsort((unique, -sizes))
+    big = order[sizes[order] >= min_size]
+    index_of = np.full(len(unique), UNGROUPED, np.int64)
+    index_of[big] = group_count + np.arange(len(big))
+    labels[faces] = index_of[inverse.reshape(-1)]
+    return labels, list(range(group_count, group_count + len(big)))
 
 
 def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray, constraints: np.ndarray,
@@ -582,7 +624,15 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
                 labels[face] = group
                 attached[face] = True
                 group_blocked[group] |= constraints[face]
+    new_groups: list[int] = []
+    if policy.leftover_merge_threshold is not None:
+        pool = np.flatnonzero((labels == UNGROUPED) & ~gated)
+        merges = leftover_merges(similarity, constraints, pool, policy.leftover_merge_threshold, policy.linkage)
+        labels, new_groups = add_leftover_groups(labels, pool, merges, policy.leftover_merge_threshold,
+                                                 policy.leftover_min_size, group_count)
+        group_count += len(new_groups)
     remaining = np.flatnonzero(labels[leftovers] == UNGROUPED)
+    # Review candidates come from the groups formed before the attach step only.
     candidates: list[list[dict]] = [[] for _ in remaining]
     if scores is not None and review_candidates and len(remaining):
         threshold = policy.review_threshold if policy.review_threshold is not None else -math.inf
@@ -599,7 +649,7 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
               for index, face in enumerate(leftovers[remaining])]
     sizes_out = np.bincount(labels[labels != UNGROUPED], minlength=group_count).astype(int).tolist()
     suggestions = group_suggestions(similarity, constraints, labels, policy.suggest_threshold, policy.max_suggestions)
-    return GroupingResult(policy, run.face_ids, labels, sizes_out, attached, gated, review, suggestions)
+    return GroupingResult(policy, run.face_ids, labels, sizes_out, attached, gated, review, suggestions, new_groups)
 
 
 def group_name(index: int) -> str:
@@ -609,12 +659,14 @@ def group_name(index: int) -> str:
 def groups_document(run: RunData, result: GroupingResult, run_folder: str | None = None) -> dict:
     """The groups file: each group's faces and photos, and each photo's groups."""
     groups = []
+    from_leftovers = set(result.leftover_groups)
     for index, size in enumerate(result.group_sizes):
         members = np.flatnonzero(result.labels == index)
         faces = [run.faces[row] for row in members]
         representative = max(faces, key=lambda face: (face["eye_distance"], face["detection_score"]))
         groups.append({"id": group_name(index), "size": size, "representative_face": representative["id"],
-                       "faces": [face["id"] for face in faces], "photos": sorted({face["photo"] for face in faces})})
+                       "faces": [face["id"] for face in faces], "photos": sorted({face["photo"] for face in faces}),
+                       "from_leftovers": index in from_leftovers})
     photos = {}
     for photo in run.photos:
         photos[photo["path"]] = {"groups": [], "review_faces": [], "faces": len(photo["faces"])}
@@ -637,7 +689,9 @@ def groups_document(run: RunData, result: GroupingResult, run_folder: str | None
                                   for item in result.suggestions],
             "notes": ["A photo with several people appears in each of their groups.",
                       "Faces in the review list did not meet the automatic thresholds; candidates are suggestions only.",
-                      "Merge suggestions name group pairs that may be one person; only the user's confirmation merges them."]}
+                      "Merge suggestions name group pairs that may be one person; only the user's confirmation merges them.",
+                      "Groups with from_leftovers were formed from faces that no other group took, often a person seen in only "
+                      "a few photos; check them before relying on them."]}
 
 
 def write_groups(path: Path, document: dict) -> None:

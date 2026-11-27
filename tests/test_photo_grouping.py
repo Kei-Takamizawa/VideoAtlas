@@ -716,3 +716,92 @@ def test_cluster_ratio_keeps_pieces_of_a_look_alike_out_of_a_big_group():
     assert .55 / within_big >= .6 > .275 / within_big
     policy = GroupingPolicy(("m",), merge_threshold=.0, cluster_merge_threshold=.2, cluster_min_size=2, cluster_min_ratio=.6)
     assert GroupingPolicy.from_json(policy.to_json()).cluster_min_ratio == .6
+
+
+def test_leftover_faces_form_new_groups_without_joining_anyone_else():
+    from videoatlas.photo_grouping import add_leftover_groups, finish_grouping, leftover_merges
+    count = 20
+    similarity = np.zeros((count, count), np.float32)
+    known, newcomer, other = np.arange(0, 10), np.arange(10, 14), np.arange(16, 20)
+    similarity[np.ix_(known, known)] = .8
+    similarity[np.ix_(newcomer, newcomer)] = .55       # one person, but below the merge threshold
+    similarity[np.ix_(other, other)] = .5
+    similarity[np.ix_(newcomer, known)] = similarity[np.ix_(known, newcomer)] = .1
+    similarity[14, 15] = similarity[15, 14] = .2        # two unrelated single faces
+    np.fill_diagonal(similarity, 1.0)
+    run = make_run([1] * 10 + [2] + [1] * 8, np.eye(count))  # faces 10 and 11 share one photo
+    constraints = same_photo_constraints(run.face_photo)
+    local = np.asarray([0] * 10 + list(range(1, 11)))
+    policy = GroupingPolicy(("m",), merge_threshold=.7, attach_threshold=.6)
+    plain = finish_grouping(run, policy, similarity, constraints, np.arange(count), local)
+    assert (plain.labels[10:] == UNGROUPED).all() and plain.leftover_groups == []
+    policy = replace(policy, leftover_merge_threshold=.45, leftover_min_size=3)
+    result = finish_grouping(run, policy, similarity, constraints, np.arange(count), local)
+    assert result.leftover_groups == [1, 2] and result.group_sizes == [10, 4, 3]
+    assert len(set(result.labels[other])) == 1 and result.labels[16] == 1
+    assert result.labels[10] != result.labels[11]                     # same photo: never one group
+    assert {int(label) for label in result.labels[newcomer]} == {2, UNGROUPED}
+    assert result.labels[14] == result.labels[15] == UNGROUPED
+    assert not result.attached[10:].any() and set(result.labels[known]) == {0}
+    review = {item["face"] for item in result.review}
+    assert review == {run.faces[row]["id"] for row in np.flatnonzero(result.labels == UNGROUPED)}
+    document = groups_document(run, result)
+    assert [group["from_leftovers"] for group in document["groups"]] == [False, True, True]
+    leftover = np.arange(10, count)
+    low = leftover_merges(similarity, constraints, leftover, .2)
+    direct = leftover_merges(similarity, constraints, leftover, .45)
+    assert (add_leftover_groups(plain.labels, leftover, low, .45, 3, 1)[0] == result.labels).all()
+    assert (add_leftover_groups(plain.labels, leftover, direct, .45, 3, 1)[0] == result.labels).all()
+    for bad in ({"leftover_min_size": 1}, {"leftover_merge_threshold": math.nan}):
+        with pytest.raises(ValueError):
+            GroupingPolicy.from_json({**policy.to_json(), **bad})
+    assert GroupingPolicy.from_json(policy.to_json()).leftover_merge_threshold == .45
+
+
+def four_separate_people(seed=7):
+    generator = np.random.default_rng(seed)
+    centers = unit(generator.normal(size=(4, 32)))
+    labels = [person for person in "ABCD" for _ in range(12)]
+    vectors = np.concatenate([centers[index] + .15 * generator.normal(size=(12, 32)) for index in range(4)])
+    run = make_run([1] * 48, vectors, labels=labels)
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    same = np.asarray(labels)[:, None] == np.asarray(labels)[None, :]
+    off = ~np.eye(48, dtype=bool)
+    return run, float((similarity[same & off].mean() + similarity[~same].mean()) / 2)
+
+
+def test_stranger_test_scores_leftover_settings_on_the_same_batches():
+    from videoatlas.photo_evaluation import stranger_test
+    run, middle = four_separate_people()
+    policy = GroupingPolicy(("m",), merge_threshold=.99)          # no group forms before the leftover step
+    report = stranger_test(run, policy, ["A", "B"], keep_sizes=(4,), repeats=2, batch=2, seed=0,
+                           leftover_grid=[(middle, 2), (-1.0, 2)])
+    entry = report["keep"]["4"]
+    assert entry["kept_faces"] == 16 and entry["not_grouped"] == 16
+    rows = {row["leftover_merge_threshold"]: row for row in entry["leftover_grid"]}
+    for row in rows.values():
+        assert sum(row[name] for name in ("not_grouped", "own_group", "other_person_group", "unlabelled_group")) == 16
+    assert rows[middle]["own_group"] == 16 and rows[middle]["wrong_rate"] == 0
+    assert rows[-1.0]["other_person_group"] == 16                 # one group of everybody
+    with_step = stranger_test(run, replace(policy, leftover_merge_threshold=middle, leftover_min_size=2), ["A", "B"],
+                              keep_sizes=(4,), repeats=2, batch=2, seed=0, leftover_grid=[(-1.0, 2)])
+    assert with_step["keep"]["4"]["own_group"] == 16
+    assert with_step["keep"]["4"]["leftover_grid"][0]["other_person_group"] == 16
+    alone = stranger_test(run, replace(policy, leftover_merge_threshold=middle, leftover_min_size=2), ["A", "B"],
+                          keep_sizes=(4,), repeats=2, batch=2, seed=0)
+    assert alone["keep"]["4"]["own_group"] == 16 and "leftover_grid" not in alone["keep"]["4"]
+    with pytest.raises(ValueError):
+        stranger_test(run, policy, ["A"], leftover_grid=[(middle, 1)])
+
+
+def test_leftover_sweep_reports_mixing_and_missing_per_setting():
+    from videoatlas.photo_evaluation import leftover_sweep
+    run, middle = four_separate_people()
+    policy = GroupingPolicy(("m",), merge_threshold=.99)
+    rows = leftover_sweep(run, policy, [(middle, 2), (-1.0, 2)], people=["A", "B", "C", "D"])
+    assert [row["leftover_merge_threshold"] for row in rows] == [None, middle, -1.0]
+    assert rows[0]["groups"] == 0 and rows[0]["missing_rate"] == 1.0 and rows[0]["review_faces"] == 48
+    assert rows[1]["mixed_faces"] == 0 and rows[1]["missing_rate"] < .2 and rows[1]["leftover_groups"]["groups"] >= 4
+    assert rows[1]["review_faces"] == 48 - rows[1]["leftover_groups"]["faces"]
+    assert rows[2]["groups"] == 1 and rows[2]["mixed_faces"] == 36 and rows[2]["leftover_groups"]["mixed_faces"] == 36
+    assert rows[2]["mixed_groups"][0]["from_leftovers"] is True

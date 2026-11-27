@@ -211,8 +211,8 @@ def cmd_group(args) -> int:
             document["evaluation_people"] = {"focus": args.people,
                                              **grouping_metrics(run, result, people=args.people, review=True)}
     write_groups(args.output, document)
-    summary = {"groups": document["group_count"], "review_faces": len(document["review"]),
-               "merge_suggestions": len(document["merge_suggestions"])}
+    summary = {"groups": document["group_count"], "groups_from_leftovers": len(result.leftover_groups),
+               "review_faces": len(document["review"]), "merge_suggestions": len(document["merge_suggestions"])}
     for key in ("evaluation", "evaluation_people"):
         if key in document:
             evaluation = document[key]
