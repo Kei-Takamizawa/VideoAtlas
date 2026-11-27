@@ -317,9 +317,17 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
     assert cli.main(["photos", "verify", str(run_folder), "--models", "fake", "--fuse", "fake,fake", "--output", str(tmp_path / "verify2.json"),
                      "--bootstrap", "5"]) == 0
     assert "fake,fake" in json.loads((tmp_path / "verify2.json").read_text())["models"]
-    assert cli.main(["photos", "group", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--output", str(tmp_path / "groups.json")]) == 0
+    assert cli.main(["photos", "group", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--output", str(tmp_path / "groups.json"),
+                     "--people", "B"]) == 0
     groups = json.loads((tmp_path / "groups.json").read_text())
     assert groups["group_count"] == 2 and groups["evaluation"]["mixing"]["mixed_faces"] == 0
+    assert groups["evaluation_people"]["focus"] == ["B"] and groups["evaluation_people"]["missing"]["photos"] == 4
+    assert cli.main(["photos", "calibrate", str(run_folder), "--models", "fake", "--output", str(tmp_path / "calibration-b.json"),
+                     "--merge-grid", "0.5:0.9:0.2", "--attach-grid", "none", "--eye-grid", "0", "--targets", "0", "--policy-target", "0",
+                     "--exclude-people", "B"]) == 0
+    calibration_b = json.loads((tmp_path / "calibration-b.json").read_text())
+    assert calibration_b["excluded_people"] == ["B"] and list(calibration_b["held_out"]["targets"]["0.0"]["folds"][0].values())[0] == "A"
+    assert len(calibration_b["held_out"]["targets"]["0.0"]["folds"]) == 1
     assert groups["photos"]["A/broken.jpg"] == {"groups": [], "review_faces": [], "faces": 0}
 
 
@@ -576,3 +584,17 @@ def test_adapt_command_writes_a_separate_embedding_space(tmp_path):
     assert (run_folder / "transforms" / "m-wccn.npz").is_file() and (run_folder / "adapt-wccn.json").is_file()
     assert cli.main(command) != 0  # refuses to overwrite
     assert cli.main(command + ["--overwrite"]) == 0
+
+
+def test_hidden_people_and_repeated_files_leave_the_answer_key():
+    from videoatlas.photo_evaluation import hide_labels
+    vectors = [[1, 0, 0], [1, .1, 0], [0, 1, 0], [0, 1, .1], [0, 0, 1], [1, .05, 0]]
+    run = make_run([1] * 6, vectors, labels=["A", "A", "B", "B", "C", "A"], hashes=["h0", "h1", "h2", "h3", "h2", "h0"])
+    # h2 is filed under B and C (a shared photo); h0 appears twice under A (a repeated file).
+    assert face_labels(run).tolist() == ["A", "A", None, "B", None, None]
+    assert set(photo_labels(run)) == {0, 1, 3}
+    hide_labels(run, ["C"])
+    assert face_labels(run).tolist() == ["A", "A", None, "B", None, None]  # the shared photo stays out
+    assert run.photos[4]["label"] is None and run.photos[4]["hidden_label"] == "C"
+    with pytest.raises(ValueError):
+        hide_labels(run, ["Nobody"])

@@ -29,6 +29,7 @@ from typing import Iterable
 import numpy as np
 
 from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, agglomerate, apply_cluster_merges, cut, finish_grouping, \
+    square_block, \
     fused_similarity, gate_mask, merge_clusters, same_photo_constraints
 from .photos import RunData
 
@@ -38,29 +39,66 @@ HISTOGRAM_BINS = 4000
 
 # ---------------------------------------------------------------- answer key
 
+def _known_label(photo: dict) -> str | None:
+    """Folder label, including labels hidden from tuning (they still mark shared photos)."""
+    return photo.get("label") or photo.get("hidden_label")
+
+
 def conflicting_hashes(run: RunData) -> set[str]:
     labels_by_hash: dict[str, set[str]] = defaultdict(set)
     for photo in run.photos:
-        if photo.get("label"):
-            labels_by_hash[photo["sha256"]].add(photo["label"])
+        if _known_label(photo):
+            labels_by_hash[photo["sha256"]].add(_known_label(photo))
     return {digest for digest, labels in labels_by_hash.items() if len(labels) > 1}
 
 
+def repeated_photos(run: RunData) -> set[int]:
+    """Indexes of photos whose exact file already appeared earlier in the run."""
+    seen: set[str] = set()
+    repeats = set()
+    for index, photo in enumerate(run.photos):
+        if photo["sha256"] in seen:
+            repeats.add(index)
+        seen.add(photo["sha256"])
+    return repeats
+
+
+def hide_labels(run: RunData, people: Iterable[str]) -> RunData:
+    """Hide these people's folder labels from tuning; their photos stay in the collection."""
+    hidden = set(people)
+    unknown = hidden - {_known_label(photo) for photo in run.photos}
+    if unknown:
+        raise ValueError(f"No labelled photos for: {', '.join(sorted(unknown))}")
+    for photo in run.photos:
+        if photo.get("label") in hidden:
+            photo["hidden_label"], photo["label"] = photo["label"], None
+    return run
+
+
 def face_labels(run: RunData) -> np.ndarray:
-    """Folder label per usable face, or None where the answer key is ambiguous."""
+    """Folder label per usable face, or None where the answer key is ambiguous.
+
+    A face is labelled only when it is the single usable face of a labelled
+    photo, the same file is not filed under two people, and it is the first
+    copy of that file.
+    """
     conflicts = conflicting_hashes(run)
+    repeats = repeated_photos(run)
     usable_count = Counter(int(index) for index in run.face_photo)
     labels = []
     for face, photo_index in zip(run.faces, run.face_photo):
         photo = run.photos[int(photo_index)]
-        clear = photo.get("label") and usable_count[int(photo_index)] == 1 and photo["sha256"] not in conflicts
+        clear = (photo.get("label") and usable_count[int(photo_index)] == 1 and photo["sha256"] not in conflicts
+                 and int(photo_index) not in repeats)
         labels.append(photo["label"] if clear else None)
     return np.asarray(labels, dtype=object)
 
 
 def photo_labels(run: RunData) -> dict[int, str]:
     conflicts = conflicting_hashes(run)
-    return {index: photo["label"] for index, photo in enumerate(run.photos) if photo.get("label") and photo["sha256"] not in conflicts}
+    repeats = repeated_photos(run)
+    return {index: photo["label"] for index, photo in enumerate(run.photos)
+            if photo.get("label") and photo["sha256"] not in conflicts and index not in repeats}
 
 
 # ------------------------------------------------------- verification scores
@@ -393,14 +431,17 @@ class _Grid:
     def _rows(self, eye: float) -> tuple[np.ndarray, list]:
         if eye not in self.trees:
             rows = np.flatnonzero(gate_mask(self.run.faces, replace(self.base, min_eye_distance=eye)))
-            merges = agglomerate(self.similarity[np.ix_(rows, rows)], self.constraints[np.ix_(rows, rows)], self.base.linkage, self.grid.merge_floor)
+            block = square_block(self.similarity, rows)  # a temporary copy unless every face passes the gate
+            merges = agglomerate(block, square_block(self.constraints, rows), self.base.linkage, self.grid.merge_floor,
+                                 overwrite=block is not self.similarity)
+            del block
             self.trees[eye] = (rows, merges)
         return self.trees[eye]
 
     def _blocks(self, eye: float) -> tuple[np.ndarray, np.ndarray]:
         if self._block_eye != eye:  # keep one gated copy at a time; the grid loops over eye first
             rows, _ = self._rows(eye)
-            self._block = (self.similarity[np.ix_(rows, rows)], self.constraints[np.ix_(rows, rows)])
+            self._block = (square_block(self.similarity, rows), square_block(self.constraints, rows))
             self._block_eye = eye
         return self._block
 
@@ -516,22 +557,27 @@ def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: Sea
     photos = photo_labels(run)
     people = sorted(set(photos.values()))
     targets = sorted(set(max_mixing_rates))
-    full_cache: dict[tuple, _Grid] = {}
+    # One full-run grid at a time: each holds an N x N matrix (about 2.5 GB at 25,000 faces).
+    full: _Grid | None = None
+    full_key: tuple | None = None
     folds: dict[float, list[dict]] = {target: [] for target in targets}
     for person in people:
         train_rows = np.flatnonzero(np.asarray([photos.get(int(index)) != person for index in run.face_photo]))
         train = _subset(run, train_rows)
         fold_base = _fold_base(train, base)
-        table = evaluate_grid(train, fold_base, grid)
         key = (fold_base.offsets, fold_base.scales)
-        if key not in full_cache:
-            full_cache[key] = _Grid(run, fold_base, grid)
+        if key != full_key:
+            full = None  # free it before the training grid is built
+        table = evaluate_grid(train, fold_base, grid)
+        del train
+        if full is None:
+            full, full_key = _Grid(run, fold_base, grid), key
         for target in targets:
             policy, train_metrics = pick(table, target)
             if policy is None:
                 folds[target].append({"held_out": person, "policy": None, "note": "No setting met the mixing limit on the other people."})
                 continue
-            test = grouping_metrics(run, full_cache[key].result(policy), labels, people=[person], review=True)
+            test = grouping_metrics(run, full.result(policy), labels, people=[person], review=True)
             folds[target].append({"held_out": person, "policy": _setting(policy),
                                   "train_mixing_rate": train_metrics["mixing"]["mixing_rate"],
                                   "train_missing_rate": train_metrics["missing"]["missing_rate"],

@@ -37,6 +37,20 @@ def _optional_grid(value: str) -> list[float | None]:
     return ([None] if keep_none else []) + (_grid(rest) if rest else [])
 
 
+def _people(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _load(args, models):
+    """Load a run and hide the labels of people kept out of tuning."""
+    from .photo_evaluation import hide_labels
+    from .photos import load_run
+    run = load_run(args.run, models)
+    if getattr(args, "exclude_people", None):
+        hide_labels(run, args.exclude_people)
+    return run
+
+
 def _write_json(path: Path, data: dict) -> None:
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,10 +107,9 @@ class _ProviderView:
 
 def cmd_verify(args) -> int:
     from .photo_evaluation import add_fused_embedding, compare_models, verification_report
-    from .photos import load_run
     fused = args.fuse or []
     needed = None if args.models is None else sorted(set(args.models) | {model for group in fused for model in group})
-    run = load_run(args.run, needed)
+    run = _load(args, needed)
     names = list(args.models or sorted(run.embeddings))
     names += [add_fused_embedding(run, group) for group in fused]
     result = {"run": str(args.run), "models": {name: verification_report(run, name) for name in names},
@@ -133,8 +146,7 @@ def _brief(metrics: dict | None) -> dict | None:
 
 def cmd_calibrate(args) -> int:
     from .photo_evaluation import SearchGrid, calibrate_leave_one_person_out, evaluate_grid, pick, table_row
-    from .photos import load_run
-    run = load_run(args.run, args.models)
+    run = _load(args, args.models)
     base = _base_policy(args, run)
     grid = SearchGrid(tuple(args.merge_grid), tuple(args.attach_grid), tuple(args.eye_grid), tuple(args.cluster_grid))
     targets = sorted(set(args.targets) | {args.policy_target})
@@ -146,6 +158,7 @@ def cmd_calibrate(args) -> int:
         policy, metrics = pick(table, target)
         all_people[str(target)] = {"policy": policy.to_json() if policy else None, "metrics": _brief(metrics)}
     result = {"run": str(args.run), "models": args.models, "policy_target": args.policy_target,
+              "excluded_people": args.exclude_people or [],
               "grid": {"merge": grid.merge, "attach": grid.attach, "min_eye_distance": grid.eye, "cluster_merge": grid.cluster,
                        "settings": len(table)},
               "held_out": held_out,
@@ -186,11 +199,21 @@ def cmd_group(args) -> int:
     result = group_faces(run, policy)
     document = groups_document(run, result, str(args.run))
     if any(photo.get("label") for photo in run.photos):
-        document["evaluation"] = grouping_metrics(run, result)
+        document["evaluation"] = grouping_metrics(run, result, review=True)
+        if args.people:
+            document["evaluation_people"] = {"focus": args.people,
+                                             **grouping_metrics(run, result, people=args.people, review=True)}
     write_groups(args.output, document)
-    summary = {"groups": document["group_count"], "review_faces": len(document["review"])}
-    if "evaluation" in document:
-        summary.update(mixing=document["evaluation"]["mixing"]["mixing_rate"], missing=document["evaluation"]["missing"]["missing_rate"])
+    summary = {"groups": document["group_count"], "review_faces": len(document["review"]),
+               "merge_suggestions": len(document["merge_suggestions"])}
+    for key in ("evaluation", "evaluation_people"):
+        if key in document:
+            evaluation = document[key]
+            summary[key] = {"mixed_faces": evaluation["mixing"]["mixed_faces"],
+                            "grouped_labelled_faces": evaluation["mixing"]["grouped_labelled_faces"],
+                            "mixing": evaluation["mixing"]["mixing_rate"], "missing": evaluation["missing"]["missing_rate"],
+                            "photos": evaluation["missing"]["photos"],
+                            "missing_after_review": {row["budget"]: row["missing_rate"] for row in evaluation.get("review_simulation", [])}}
     print(json.dumps(summary, indent=2))
     return 0
 
@@ -244,6 +267,7 @@ def add_photo_commands(commands, common) -> None:
     verify.add_argument("run", type=Path)
     verify.add_argument("--models", type=_models)
     verify.add_argument("--output", type=Path, required=True)
+    verify.add_argument("--exclude-people", type=_people, help="comma-separated people whose labels are hidden (kept for testing)")
     verify.add_argument("--fuse", type=_models, action="append",
                         help="also measure the fused score of these comma-separated models (repeatable)")
     verify.add_argument("--bootstrap", type=int, default=1000)
@@ -255,6 +279,8 @@ def add_photo_commands(commands, common) -> None:
     calibrate.add_argument("--models", type=_models, required=True)
     calibrate.add_argument("--output", type=Path, required=True)
     calibrate.add_argument("--policy-output", type=Path, help="write the policy chosen on all people here")
+    calibrate.add_argument("--exclude-people", type=_people,
+                           help="comma-separated people kept out of tuning; their photos stay in the collection unlabelled")
     calibrate.add_argument("--targets", type=_grid, default=[0.0, 0.0005, 0.001, 0.002, 0.005, 0.01],
                            help="mixing limits to evaluate; each gives one held-out estimate")
     calibrate.add_argument("--policy-target", type=float, default=0.002, help="mixing limit for the written policy")
@@ -300,4 +326,5 @@ def add_photo_commands(commands, common) -> None:
     group.add_argument("run", type=Path)
     group.add_argument("--policy", type=Path, required=True)
     group.add_argument("--output", type=Path, required=True)
+    group.add_argument("--people", type=_people, help="also report errors that involve only these people (for example a test set)")
     group.set_defaults(handler=cmd_group)

@@ -108,10 +108,23 @@ def fused_similarity(embeddings: dict[str, np.ndarray], policy: GroupingPolicy, 
     offsets = policy.offsets or (0.0,) * len(policy.models)
     scales = policy.scales or (1.0,) * len(policy.models)
     for name, weight, offset, scale in zip(policy.models, weights, offsets, scales):
-        vectors = embeddings[name] if rows is None else embeddings[name][rows]
-        part = (vectors @ vectors.T - np.float32(offset)) * np.float32(weight / scale)
-        total = part if total is None else total + part
-    return (total / np.float32(sum(weights))).astype(np.float32, copy=False)
+        vectors = np.asarray(embeddings[name] if rows is None else embeddings[name][rows], np.float32)
+        part = vectors @ vectors.T  # in-place steps below keep at most two N x N arrays alive
+        part -= np.float32(offset)
+        part *= np.float32(weight / scale / sum(weights))
+        if total is None:
+            total = part
+        else:
+            total += part
+            del part
+    return total
+
+
+def square_block(matrix: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """matrix[rows][:, rows]; the matrix itself (no copy) when rows are all rows in order."""
+    if len(rows) == matrix.shape[0] and (len(rows) == 0 or (rows[0] == 0 and rows[-1] == len(rows) - 1)):
+        return matrix
+    return matrix[np.ix_(rows, rows)]
 
 
 def same_photo_constraints(face_photo: np.ndarray) -> np.ndarray:
@@ -123,7 +136,7 @@ def same_photo_constraints(face_photo: np.ndarray) -> np.ndarray:
 
 
 def agglomerate(similarity: np.ndarray, cannot_link: np.ndarray | None = None, linkage: str = "average",
-                floor: float = -math.inf) -> list[tuple[int, int, float]]:
+                floor: float = -math.inf, overwrite: bool = False) -> list[tuple[int, int, float]]:
     """Constrained agglomerative clustering with the nearest-neighbour-chain algorithm.
 
     Returns merges as (kept representative, absorbed representative, similarity)
@@ -131,13 +144,19 @@ def agglomerate(similarity: np.ndarray, cannot_link: np.ndarray | None = None, l
     complete linkage are reducible, and cannot-link pairs act as infinite
     distance, which keeps them reducible. Cutting the merges at any threshold
     at or above ``floor`` therefore gives the same clusters as running the
-    clustering at that threshold.
+    clustering at that threshold. With ``overwrite`` the inputs are used as
+    working memory when their types allow it; pass it only for temporary copies.
     """
-    values = np.array(similarity, dtype=np.float64, copy=True)
-    count = values.shape[0]
+    count = similarity.shape[0]
+    # Sums of similarities; float32 halves memory for large runs (relative error ~1e-7).
+    dtype = np.float64 if count <= 8192 else np.float32
+    values = np.asarray(similarity, dtype) if overwrite else np.array(similarity, dtype, copy=True)
     if values.shape != (count, count):
         raise ValueError("similarity must be square")
-    blocked = np.zeros((count, count), bool) if cannot_link is None else np.array(cannot_link, dtype=bool, copy=True)
+    if cannot_link is None:
+        blocked = np.zeros((count, count), bool)
+    else:
+        blocked = np.asarray(cannot_link, bool) if overwrite else np.array(cannot_link, bool, copy=True)
     sizes = np.ones(count, np.float64)
     active = np.ones(count, bool)
     merges: list[tuple[int, int, float]] = []
@@ -213,22 +232,41 @@ def top_k_means(similarity_rows: np.ndarray, members: np.ndarray, k: int) -> np.
 
 
 class ClusterSums:
-    """Sums of pairwise similarities within and between clusters, for cluster-level scores."""
+    """Sums of pairwise similarities within and between clusters, for cluster-level scores.
 
-    def __init__(self, similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray) -> None:
+    ``items`` selects the rows and columns of ``similarity`` that take part
+    (default: all); ``labels`` gives one cluster label per item. Sums are
+    built in row chunks, so no item-by-item copy of the matrix is made.
+    """
+
+    def __init__(self, similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray,
+                 items: np.ndarray | None = None, chunk: int = 1024) -> None:
+        labels = np.asarray(labels)
+        items = np.arange(len(labels)) if items is None else np.asarray(items)
         values, inverse = np.unique(labels, return_inverse=True)
         inverse = inverse.reshape(-1)
         count = len(values)
-        onehot = np.zeros((len(inverse), count), np.float32)
-        onehot[np.arange(len(inverse)), inverse] = 1
-        # float32 row sums (relative error ~1e-6 here), then float64 for the cluster totals.
-        partial = np.asarray(similarity, np.float32) @ onehot
-        self.cross = onehot.T.astype(np.float64) @ partial.astype(np.float64)
-        self.diagonal = np.bincount(inverse, weights=np.diag(similarity).astype(np.float64), minlength=count)
-        left, right = np.nonzero(constraints)
+        order = np.argsort(inverse, kind="stable")
+        ordered = items[order]
+        counts = np.bincount(inverse, minlength=count)
+        starts = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int64)
+        partial = np.empty((len(ordered), count), np.float64)
+        for begin in range(0, len(ordered), chunk):
+            block = np.asarray(similarity[ordered[begin:begin + chunk]][:, ordered], np.float64)
+            partial[begin:begin + chunk] = np.add.reduceat(block, starts, axis=1)
+        self.cross = np.add.reduceat(partial, starts, axis=0) if len(ordered) else np.zeros((0, 0))
+        del partial
+        self.diagonal = np.bincount(inverse, weights=np.asarray(similarity[items, items], np.float64), minlength=count)
+        position = np.full(similarity.shape[0], -1, np.int64)
+        position[items] = inverse
         self.blocked = np.zeros((count, count), bool)
-        self.blocked[inverse[left], inverse[right]] = True
-        self.sizes = np.bincount(inverse, minlength=count).astype(np.float64)
+        for begin in range(0, len(items), chunk * 8):
+            rows = items[begin:begin + chunk * 8]
+            left, right = np.nonzero(constraints[rows])
+            right_cluster = position[right]
+            keep = right_cluster >= 0
+            self.blocked[position[rows[left[keep]]], right_cluster[keep]] = True
+        self.sizes = counts.astype(np.float64)
         self.values = values
         self.inverse = inverse
 
@@ -264,7 +302,7 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
     if floor is None or len(big) < 2:
         return cluster_of, merges
     items = np.flatnonzero(np.isin(cluster_of, big))
-    sums = ClusterSums(similarity[np.ix_(items, items)], constraints[np.ix_(items, items)], cluster_of[items])
+    sums = ClusterSums(similarity, constraints, cluster_of[items], items)
     ids = sums.values  # cluster index of each local cluster
     count = len(ids)
     active = np.ones(count, bool)
@@ -274,10 +312,13 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
         scores[np.minimum.outer(sizes, sizes) > max_smaller] = -math.inf
     with np.errstate(divide="ignore", invalid="ignore"):
         within = (np.diag(sums.cross) - sums.diagonal) / (sizes * (sizes - 1))
+    # Best partner of every cluster, so each step needs no search over all pairs.
+    best_index = np.argmax(scores, axis=1)
+    best_value = scores[np.arange(count), best_index]
     while True:
-        flat = int(np.argmax(scores))
-        left, right = divmod(flat, count)
-        best = float(scores[left, right])
+        left = int(np.argmax(best_value))
+        right = int(best_index[left])
+        best = float(best_value[left])
         if not best >= floor:
             break
         keep, drop = min(left, right), max(left, right)
@@ -307,6 +348,18 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
         scores[:, keep] = row
         scores[drop] = -math.inf
         scores[:, drop] = -math.inf
+        best_value[drop] = -math.inf
+        stale = (best_index == keep) | (best_index == drop)
+        stale[keep] = True
+        stale[drop] = False
+        if stale.any():
+            rows = np.flatnonzero(stale)
+            best_index[rows] = np.argmax(scores[rows], axis=1)
+            best_value[rows] = scores[rows, best_index[rows]]
+        better = row > best_value
+        better[keep] = False
+        best_index[better] = keep
+        best_value[better] = row[better]
     return cluster_of, merges
 
 
@@ -335,7 +388,7 @@ def group_suggestions(similarity: np.ndarray, constraints: np.ndarray, labels: n
     grouped = np.flatnonzero(labels != UNGROUPED)
     if threshold is None or limit == 0 or not len(grouped):
         return []
-    sums = ClusterSums(similarity[np.ix_(grouped, grouped)], constraints[np.ix_(grouped, grouped)], labels[grouped])
+    sums = ClusterSums(similarity, constraints, labels[grouped], grouped)
     scores = sums.scores(2)
     upper = np.triu(np.ones_like(scores, dtype=bool), k=1)
     left, right = np.nonzero(upper & (scores >= threshold))
@@ -376,9 +429,12 @@ def group_faces(run: RunData, policy: GroupingPolicy, cannot_link: np.ndarray | 
         constraints |= cannot_link
     rows = np.flatnonzero(passed)
     if merges is None:
-        merges = agglomerate(similarity[np.ix_(rows, rows)], constraints[np.ix_(rows, rows)], policy.linkage, policy.merge_threshold)
+        block = square_block(similarity, rows)
+        merges = agglomerate(block, square_block(constraints, rows), policy.linkage, policy.merge_threshold,
+                             overwrite=block is not similarity)
+        del block
     local = cut(merges, len(rows), policy.merge_threshold)
-    local = stage_two(similarity[np.ix_(rows, rows)], constraints[np.ix_(rows, rows)], local, policy)
+    local = stage_two(square_block(similarity, rows), square_block(constraints, rows), local, policy)
     return finish_grouping(run, policy, similarity, constraints, rows, local)
 
 
