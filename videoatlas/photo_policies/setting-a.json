@@ -1,0 +1,55 @@
+{
+ "models": [
+  "glintr100+flip",
+  "lvface-b+flip"
+ ],
+ "merge_threshold": 10.5,
+ "attach_threshold": 3.0,
+ "attach_margin": 0.05,
+ "attach_min_ratio": 0.6,
+ "attach_top_k": 5,
+ "review_threshold": null,
+ "min_group_size": 2,
+ "min_eye_distance": 0.0,
+ "max_abs_yaw_ratio": null,
+ "linkage": "average",
+ "cluster_merge_threshold": 0.3,
+ "cluster_min_size": 2,
+ "cluster_auto_max_size": 30,
+ "cluster_min_ratio": 0.5,
+ "suggest_threshold": 0.2,
+ "max_suggestions": 500,
+ "weights": null,
+ "offsets": [
+  0.1448555737733841,
+  0.05226527526974678
+ ],
+ "scales": [
+  0.10144433379173279,
+  0.0692269578576088
+ ],
+ "calibration": {
+  "chosen": "2026-11-27, setting A (new groups from leftover faces without attach)",
+  "evaluation": "docs/photo-grouping-evaluation.md",
+  "tuned_on": "18 development people of the 28-person labelled run",
+  "max_mixing_rate": 0.0005,
+  "max_newcomer_rate": 0.01,
+  "held_out": null,
+  "excluded_people": [
+   "ChaeWon",
+   "ChaeYeon",
+   "HaYeon",
+   "JiYeon",
+   "Kaede",
+   "Mei",
+   "Pharita",
+   "Serina",
+   "YooYeon",
+   "Zena"
+  ]
+ },
+ "leftover_merge_threshold": 7.0,
+ "leftover_min_size": 2,
+ "leftover_max_known_score": null,
+ "leftover_attach": false
+}

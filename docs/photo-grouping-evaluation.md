@@ -115,7 +115,7 @@ All 66 mixed faces are in one group: the ChaeWon group (688 faces) took 49 Serin
 
 ## Whole-cluster check in the cluster merge (2026-11-27)
 
-`cluster_min_ratio` blocks a cluster merge unless the mean score between the two clusters reaches a share of the larger cluster's own mean pair score. A piece of a look-alike person is close to a few faces of the big group, but not to the group as a whole, so its ratio stays low. The value 0.5 was chosen on the development people only (mixing 0.017%, missing 5.09%, newcomer estimate 0.89%).
+`cluster_min_ratio` blocks a cluster merge unless the mean score between the two clusters reaches a share of the larger cluster's own mean pair score. A piece of a look-alike person is close to a few faces of the big group, but not to the group as a whole, so its ratio stays low. The value 0.5 was chosen on the development people only (mixing 0.017%, missing 5.09%, newcomer estimate 0.89%). Calibration with this check also changed the attach threshold: the resulting policy (`policy-dev-open2.json`) uses merge 10.5, cluster merge 0.3 with the size cap of 30, cluster ratio 0.5, and attach 3.0 with margin 0.05 and ratio 0.6.
 
 Second check on the 10 test people. This is the second time these people were looked at, and the failure seen in the first check guided this change, so these numbers are somewhat optimistic:
 
@@ -180,6 +180,8 @@ The "another person's" column first looked like a large failure: 12% to 17%, mos
 With 1 or 3 photos kept, the kept faces cannot outnumber a few labelled faces, so most of these are the same kind of group (the newcomer's own group-photo faces plus a few labelled faces of someone else), going by the estimate; the estimate uses the same models and is not an answer key. On the development people the same measure is 3.7% / 1.9% / 0.6% / 0.7%.
 
 The remaining real errors are the labelled faces of known people that such newcomer groups take (for example the 16 Yuha, A-na and YeonJi faces), and a person with few photos being split into many small groups (Kumi). These 14 people are no longer unseen; another unbiased check needs new labelled people.
+
+The chosen policy is stored in the repository as [`videoatlas/photo_policies/setting-a.json`](../videoatlas/photo_policies/setting-a.json). It needs a run analyzed with `--models face01,glintr100+flip,lvface-b+flip`.
 
 
 ## Limits of this evidence

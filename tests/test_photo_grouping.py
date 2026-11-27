@@ -922,3 +922,13 @@ def test_a_group_made_mostly_of_the_newcomer_is_not_counted_as_another_persons()
     entry = stranger_test(run, loose, ["A"], keep_sizes=(1,), repeats=3, batch=1, seed=1)["keep"]["1"]
     assert entry["other_person_group"] == 3 and entry["other_person_group_led_by_newcomer"] == 0
     assert entry["in_group_led_by_another_person_rate"] == 1.0
+
+
+def test_shipped_policy_loads_and_keeps_its_safeguards():
+    path = Path(__file__).resolve().parents[1] / "videoatlas" / "photo_policies" / "setting-a.json"
+    policy = GroupingPolicy.from_json(json.loads(path.read_text(encoding="utf-8")))
+    policy.validate()
+    assert policy.models == ("glintr100+flip", "lvface-b+flip")
+    assert policy.cluster_auto_max_size == 30 and policy.cluster_min_ratio == .5 and policy.attach_min_ratio == .6
+    assert policy.leftover_merge_threshold == 7.0 and policy.leftover_min_size == 2 and not policy.leftover_attach
+    assert policy.to_json() == json.loads(path.read_text(encoding="utf-8"))
