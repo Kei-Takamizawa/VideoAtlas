@@ -222,6 +222,21 @@ def cmd_group(args) -> int:
     return 0
 
 
+def cmd_strangers(args) -> int:
+    from .photo_evaluation import stranger_test
+    from .photo_grouping import GroupingPolicy
+    from .photos import load_run
+    policy = GroupingPolicy.from_json(json.loads(Path(args.policy).read_text(encoding="utf-8")))
+    run = load_run(args.run, policy.models)
+    people = args.people or sorted({photo["label"] for photo in run.photos if photo.get("label")})
+    result = {"run": str(args.run), "policy": str(args.policy),
+              **stranger_test(run, policy, people, args.keep, args.repeats, args.batch, args.seed)}
+    _write_json(args.output, result)
+    print(json.dumps({size: {key: value for key, value in entry.items() if key != "wrong"} for size, entry in result["keep"].items()},
+                     indent=2, default=_json_default))
+    return 0
+
+
 def cmd_adapt(args) -> int:
     """Write WCCN-whitened copies of embeddings, learned from a first grouping of the same run."""
     from .photo_backend import within_class_whitening
@@ -327,6 +342,18 @@ def add_photo_commands(commands, common) -> None:
     identify.add_argument("--repeats", type=int, default=5)
     identify.add_argument("--max-wrong", type=float, default=0.001)
     identify.set_defaults(handler=cmd_identify)
+
+    strangers = actions.add_parser("strangers", help="measure how often a person with only a few photos joins another person's group")
+    strangers.add_argument("run", type=Path)
+    strangers.add_argument("--policy", type=Path, required=True)
+    strangers.add_argument("--output", type=Path, required=True)
+    strangers.add_argument("--people", type=_people, help="people to treat as newcomers (default: every labelled person)")
+    strangers.add_argument("--keep", type=lambda value: [int(item) for item in value.split(",")], default=[1, 3],
+                           help="photos each newcomer keeps, comma-separated")
+    strangers.add_argument("--repeats", type=int, default=3)
+    strangers.add_argument("--batch", type=int, default=5, help="newcomers removed together in one grouping run")
+    strangers.add_argument("--seed", type=int, default=0)
+    strangers.set_defaults(handler=cmd_strangers)
 
     group = actions.add_parser("group", help="group a run with a policy file and write the groups file")
     group.add_argument("run", type=Path)

@@ -29,8 +29,7 @@ from typing import Iterable
 import numpy as np
 
 from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, agglomerate, apply_cluster_merges, cut, finish_grouping, \
-    square_block, \
-    fused_similarity, gate_mask, merge_clusters, same_photo_constraints
+    fused_similarity, gate_mask, group_faces, merge_clusters, same_photo_constraints, square_block, top_k_means
 from .photos import RunData
 
 FMR_TARGETS = (1e-2, 1e-3, 1e-4)
@@ -604,6 +603,117 @@ def calibrate_leave_one_person_out(run: RunData, base: GroupingPolicy, grid: Sea
         results[str(target)] = {"folds": folds[target], "held_out": held_out}
     return {"method": "leave-one-person-out: settings chosen on the other people; errors counted only where the held-out person is involved",
             "targets": results}
+
+
+# ---------------------------------------------------------------- open-set check
+
+STRANGER_OUTCOMES = ("not_grouped", "own_group", "other_person_group", "unlabelled_group")
+
+
+def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], keep_sizes: Iterable[int] = (1, 3),
+                  repeats: int = 3, batch: int = 5, seed: int = 0) -> dict:
+    """How often a person with only a few photos is put into a group of other people.
+
+    Real collections keep adding people who appear in only one or a few
+    photos. For each repeat and keep size, the named people are split into
+    batches. In a batch, each person keeps ``keep`` random answer-key photos,
+    and all their other photos (and every copy of those files) are removed;
+    the rest of the collection is unchanged. A kept face is placed correctly
+    when it is left out of the groups (review) or its group holds only that
+    person's kept faces. Any other placement counts as wrong. This is
+    conservative: a group of unlabelled faces can be the same person seen in
+    another person's group photo.
+    """
+    focus = sorted(set(people))
+    unknown = set(focus) - {_known_label(photo) for photo in run.photos}
+    if unknown:
+        raise ValueError(f"No labelled photos for: {', '.join(sorted(unknown))}")
+    conflicts, repeated = conflicting_hashes(run), repeated_photos(run)
+    usable = Counter(int(index) for index in run.face_photo)
+    face_hash = np.asarray([run.photos[int(index)]["sha256"] for index in run.face_photo], dtype=object)
+    # Answer-key label per face; people hidden from tuning still count as people here.
+    key = np.full(len(run.faces), None, dtype=object)
+    candidates: dict[str, list[int]] = defaultdict(list)
+    hashes: dict[str, set[str]] = defaultdict(set)
+    for photo in run.photos:
+        if _known_label(photo) in focus:
+            hashes[_known_label(photo)].add(photo["sha256"])
+    for row, index in enumerate(run.face_photo):
+        photo = run.photos[int(index)]
+        if usable[int(index)] == 1 and photo["sha256"] not in conflicts and int(index) not in repeated and _known_label(photo):
+            key[row] = _known_label(photo)
+            if key[row] in focus:
+                candidates[key[row]].append(row)
+    full = fused_similarity(run.embeddings, policy)
+    generator = np.random.default_rng(seed)
+    sizes = sorted(set(int(size) for size in keep_sizes))
+    if not sizes or sizes[0] < 1 or batch < 1 or repeats < 1:
+        raise ValueError("keep sizes, batch and repeats must be at least 1")
+    report = {"method": stranger_test.__doc__.split("\n\n")[0].strip(), "people": focus, "repeats": repeats, "batch": batch,
+              "seed": seed, "attach_threshold": policy.attach_threshold, "keep": {}}
+    for size in sizes:
+        counts = Counter()
+        details, best_scores = [], []
+        for _ in range(repeats):
+            order = [focus[index] for index in generator.permutation(len(focus))]
+            for start in range(0, len(order), batch):
+                chunk = order[start:start + batch]
+                kept: dict[int, str] = {}
+                for person in chunk:
+                    pool = candidates.get(person, [])
+                    for row in generator.choice(pool, size=min(size, len(pool)), replace=False) if pool else []:
+                        kept[int(row)] = person
+                removed = set().union(*(hashes[person] for person in chunk))
+                rows = np.asarray(sorted(set(np.flatnonzero([digest not in removed for digest in face_hash]).tolist()) | set(kept)))
+                position = {int(row): index for index, row in enumerate(rows)}
+                sub = _subset(run, rows)
+                similarity = square_block(full, rows)
+                result = group_faces(sub, policy, similarity=similarity)
+                sub_key = key[rows]
+                own = {position[row]: person for row, person in kept.items()}
+                members_of = defaultdict(list)
+                for index, group in enumerate(result.labels):
+                    if group != UNGROUPED:
+                        members_of[int(group)].append(index)
+                for index, person in own.items():
+                    group = int(result.labels[index])
+                    others = [] if group == UNGROUPED else [member for member in members_of[group] if own.get(member) != person]
+                    if group == UNGROUPED:
+                        outcome, majority = "not_grouped", None
+                    elif not others:
+                        outcome, majority = "own_group", person
+                    else:
+                        named = Counter(sub_key[member] for member in others if sub_key[member] is not None)
+                        majority = named.most_common(1)[0][0] if named else None
+                        outcome = "other_person_group" if majority is not None else "unlabelled_group"
+                    counts[outcome] += 1
+                    row = similarity[[index]]
+                    scores = [(float(top_k_means(row, np.asarray([member for member in members if member != index]),
+                                                 policy.attach_top_k)[0]), group_index)
+                              for group_index, members in members_of.items()
+                              if any(own.get(member) != person for member in members if member != index)]
+                    best = max(scores) if scores else (None, None)
+                    if best[0] is not None:
+                        best_scores.append(best[0])
+                    if outcome in ("other_person_group", "unlabelled_group"):
+                        details.append({"person": person, "outcome": outcome, "group_majority": majority, "group_size": len(members_of[group]),
+                                        "attached": bool(result.attached[index]),
+                                        "best_other_group_score": None if best[0] is None else round(best[0], 4)})
+                del similarity, result, sub
+        kept_faces = sum(counts.values())
+        wrong = counts["other_person_group"] + counts["unlabelled_group"]
+        values = np.asarray(best_scores)
+        quantiles = {f"p{int(q * 100):02d}": round(float(np.quantile(values, q)), 4) for q in (.5, .9, .99)} if values.size else {}
+        if values.size:
+            quantiles["max"] = round(float(values.max()), 4)
+        report["keep"][str(size)] = {"kept_faces": kept_faces, **{name: counts[name] for name in STRANGER_OUTCOMES},
+                                     "wrong_rate": _ratio(wrong, kept_faces),
+                                     "wrong_by_attach": sum(1 for item in details if item["attached"]),
+                                     "best_score_in_another_group": quantiles,
+                                     "above_attach_threshold": None if policy.attach_threshold is None or not values.size
+                                     else _ratio(int(np.sum(values >= policy.attach_threshold)), int(values.size)),
+                                     "wrong": details}
+    return report
 
 
 def impostor_normalization(run: RunData, models: Iterable[str], labels: np.ndarray | None = None) -> tuple[tuple[float, ...], tuple[float, ...]]:

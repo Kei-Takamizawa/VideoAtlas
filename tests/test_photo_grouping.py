@@ -2,6 +2,7 @@ import itertools
 import json
 import math
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 
 import cv2
@@ -333,6 +334,10 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
                      "--eye-grid", "0", "--targets", "0", "--policy-target", "0", "--exclude-people", "B", "--skip-held-out"]) == 0
     assert json.loads((tmp_path / "calibration-c.json").read_text())["held_out"] is None
     assert json.loads((tmp_path / "policy-c.json").read_text())["calibration"]["excluded_people"] == ["B"]
+    assert cli.main(["photos", "strangers", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--people", "B", "--keep", "1",
+                     "--repeats", "2", "--output", str(tmp_path / "strangers.json")]) == 0
+    strangers = json.loads((tmp_path / "strangers.json").read_text())
+    assert strangers["people"] == ["B"] and strangers["keep"]["1"]["kept_faces"] == 2
     assert groups["photos"]["A/broken.jpg"] == {"groups": [], "review_faces": [], "faces": 0}
 
 
@@ -603,3 +608,27 @@ def test_hidden_people_and_repeated_files_leave_the_answer_key():
     assert run.photos[4]["label"] is None and run.photos[4]["hidden_label"] == "C"
     with pytest.raises(ValueError):
         hide_labels(run, ["Nobody"])
+
+
+def test_stranger_test_catches_newcomers_absorbed_by_a_loose_attach():
+    from videoatlas.photo_evaluation import stranger_test
+    generator = np.random.default_rng(3)
+    centers = unit(generator.normal(size=(4, 32)))
+    labels = [person for person in "ABCD" for _ in range(12)]
+    vectors = np.concatenate([centers[index] + 0.25 * generator.normal(size=(12, 32)) for index in range(4)])
+    run = make_run([1] * 48, vectors, labels=labels)
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    within = similarity[:12, :12][np.triu_indices(12, 1)].mean()
+    strict = GroupingPolicy(("m",), merge_threshold=float(within) - .05)
+    loose = replace(strict, attach_threshold=-1.0, attach_margin=0.0)
+    safe = stranger_test(run, strict, ["A", "B"], keep_sizes=(1, 2), repeats=2, batch=2, seed=1)
+    assert safe["keep"]["1"]["kept_faces"] == 4 and safe["keep"]["1"]["not_grouped"] == 4
+    assert safe["keep"]["1"]["wrong_rate"] == 0
+    assert safe["keep"]["2"]["own_group"] + safe["keep"]["2"]["not_grouped"] == 8
+    absorbed = stranger_test(run, loose, ["A"], keep_sizes=(1,), repeats=3, batch=1, seed=1)
+    entry = absorbed["keep"]["1"]
+    assert entry["kept_faces"] == 3 and entry["other_person_group"] == 3 and entry["wrong_rate"] == 1.0
+    assert entry["wrong_by_attach"] == 3 and entry["above_attach_threshold"] == 1.0
+    assert {item["group_majority"] for item in entry["wrong"]} <= {"B", "C", "D"}
+    with pytest.raises(ValueError):
+        stranger_test(run, strict, ["Nobody"])
