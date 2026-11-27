@@ -402,6 +402,7 @@ class SearchGrid:
 
     ``margin`` and ``ratio`` apply only when attach is on; an empty margin
     tuple keeps the base policy's margin, and None in ratio turns that check off.
+    ``cluster_ratio`` is the cluster merge's whole-cluster check (None: off).
     """
     merge: tuple[float, ...]
     attach: tuple[float | None, ...] = (None,)
@@ -409,6 +410,7 @@ class SearchGrid:
     cluster: tuple[float | None, ...] = (None,)
     margin: tuple[float, ...] = ()
     ratio: tuple[float | None, ...] = (None,)
+    cluster_ratio: tuple[float | None, ...] = ()  # empty: the base policy's cluster_min_ratio
 
     @property
     def merge_floor(self) -> float:
@@ -454,26 +456,31 @@ class _Grid:
             self._block_eye = eye
         return self._block
 
-    def local_labels(self, eye: float, merge: float, cluster: float | None) -> tuple[np.ndarray, np.ndarray]:
+    def local_labels(self, eye: float, merge: float, cluster: float | None,
+                     cluster_ratio: float | None = None) -> tuple[np.ndarray, np.ndarray]:
         rows, merges = self._rows(eye)
         if (eye, merge) not in self.cuts:
             self.cuts[(eye, merge)] = cut(merges, len(rows), merge)
         local = self.cuts[(eye, merge)]
         if cluster is None:
             return rows, local
-        key = (eye, merge)
+        key = (eye, merge, cluster_ratio)
         if key not in self.cluster_trees:
             similarity, constraints = self._blocks(eye)
             self.cluster_trees[key] = merge_clusters(similarity, constraints, local, self.base.cluster_min_size, self.grid.cluster_floor,
-                                                     self.base.cluster_auto_max_size)
+                                                     self.base.cluster_auto_max_size, cluster_ratio)
         cluster_of, cluster_merges = self.cluster_trees[key]
         return rows, apply_cluster_merges(cluster_of, cluster_merges, cluster)
 
+    @staticmethod
+    def _structure(policy: GroupingPolicy) -> tuple:
+        return (policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold, policy.cluster_min_ratio)
+
     def result(self, policy: GroupingPolicy, suggestions: bool = True) -> GroupingResult:
-        rows, local = self.local_labels(policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold)
+        rows, local = self.local_labels(*self._structure(policy))
         if not suggestions:
             policy = replace(policy, suggest_threshold=None)
-        key = (policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold)
+        key = self._structure(policy)
         if key not in self.attach_scores:
             self.attach_scores = {key: {}}  # the grid loops over attach last, so one entry is enough
         return finish_grouping(self.run, policy, self.similarity, self.constraints, rows, local, self.attach_scores[key],
@@ -482,7 +489,7 @@ class _Grid:
     def newcomer(self, policy: GroupingPolicy) -> dict:
         """Share of sampled labelled faces that the attach step would put into another person's group
         if their own person had no group yet (a stand-in for people seen for the first time)."""
-        key = (policy.min_eye_distance, policy.merge_threshold, policy.cluster_merge_threshold)
+        key = self._structure(policy)
         if key not in self.newcomer_cache:
             self.newcomer_cache = {key: self._newcomer_scores(*key)}  # the grid loops over attach settings last
         data = self.newcomer_cache[key]
@@ -495,9 +502,9 @@ class _Grid:
         return {"faces": int(len(accepted)), "accepted": int(accepted.sum()), "rate": _ratio(int(accepted.sum()), len(accepted)),
                 "mean_person_rate": _mean(rates), "max_person_rate": max(rates) if rates else None}
 
-    def _newcomer_scores(self, eye: float, merge: float, cluster: float | None) -> dict:
+    def _newcomer_scores(self, eye: float, merge: float, cluster: float | None, cluster_ratio: float | None) -> dict:
         faces = self.newcomer_faces
-        rows, local = self.local_labels(eye, merge, cluster)
+        rows, local = self.local_labels(eye, merge, cluster, cluster_ratio)
         group_of, members = initial_groups(len(self.run.faces), rows, local, self.base.min_group_size)
         person = self.labels[faces]
         _, led_by = _majorities(group_of, self.labels)
@@ -531,18 +538,23 @@ class _Grid:
 
     def policies(self):
         margins = self.grid.margin or (self.base.attach_margin,)
+        cluster_ratios = self.grid.cluster_ratio or (self.base.cluster_min_ratio,)
         for eye in self.grid.eye:
             for merge in self.grid.merge:
-                for cluster in self.grid.cluster:
-                    for attach in self.grid.attach:
-                        if attach is None:
-                            yield replace(self.base, min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
-                                          attach_threshold=None)
-                            continue
-                        for margin in margins:
-                            for ratio in self.grid.ratio:
-                                yield replace(self.base, min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
-                                              attach_threshold=attach, attach_margin=margin, attach_min_ratio=ratio)
+                for cluster_ratio in cluster_ratios:
+                    for cluster in self.grid.cluster:
+                        if cluster is None and cluster_ratio != cluster_ratios[0]:
+                            continue  # the ratio only matters when the cluster merge is on
+                        common = dict(min_eye_distance=eye, merge_threshold=merge, cluster_merge_threshold=cluster,
+                                      cluster_min_ratio=cluster_ratio if cluster is not None else None)
+                        for attach in self.grid.attach:
+                            if attach is None:
+                                yield replace(self.base, **common, attach_threshold=None)
+                                continue
+                            for margin in margins:
+                                for ratio in self.grid.ratio:
+                                    yield replace(self.base, **common, attach_threshold=attach, attach_margin=margin,
+                                                  attach_min_ratio=ratio)
 
 
 def newcomer_sample(labels: np.ndarray, per_person: int, seed: int = 0) -> np.ndarray:
@@ -565,6 +577,7 @@ def _conservative(policy: GroupingPolicy) -> tuple:
     return (-policy.merge_threshold, -(policy.cluster_merge_threshold if policy.cluster_merge_threshold is not None else math.inf),
             -(policy.attach_threshold if policy.attach_threshold is not None else math.inf),
             -(policy.attach_min_ratio if policy.attach_min_ratio is not None else -math.inf), -policy.attach_margin,
+            -(policy.cluster_min_ratio if policy.cluster_min_ratio is not None else -math.inf),
             -policy.min_eye_distance)
 
 
@@ -612,7 +625,8 @@ def table_row(policy: GroupingPolicy, metrics: dict) -> dict:
 def _setting(policy: GroupingPolicy) -> dict:
     return {"min_eye_distance": policy.min_eye_distance, "merge_threshold": policy.merge_threshold,
             "cluster_merge_threshold": policy.cluster_merge_threshold, "attach_threshold": policy.attach_threshold,
-            "attach_margin": policy.attach_margin, "attach_min_ratio": policy.attach_min_ratio}
+            "attach_margin": policy.attach_margin, "attach_min_ratio": policy.attach_min_ratio,
+            "cluster_min_ratio": policy.cluster_min_ratio}
 
 
 def _fold_base(run: RunData, base: GroupingPolicy) -> GroupingPolicy:

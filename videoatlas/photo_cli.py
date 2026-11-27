@@ -149,7 +149,7 @@ def cmd_calibrate(args) -> int:
     run = _load(args, args.models)
     base = _base_policy(args, run)
     grid = SearchGrid(tuple(args.merge_grid), tuple(args.attach_grid), tuple(args.eye_grid), tuple(args.cluster_grid),
-                      tuple(args.attach_margin_grid or ()), tuple(args.attach_ratio_grid))
+                      tuple(args.attach_margin_grid or ()), tuple(args.attach_ratio_grid), tuple(args.cluster_ratio_grid or ()))
     targets = sorted(set(args.targets) | {args.policy_target})
     started = time.monotonic()
     held_out = None if args.skip_held_out else calibrate_leave_one_person_out(run, base, grid, targets, args.newcomer_limit)
@@ -161,7 +161,8 @@ def cmd_calibrate(args) -> int:
     result = {"run": str(args.run), "models": args.models, "policy_target": args.policy_target,
               "excluded_people": args.exclude_people or [], "newcomer_limit": args.newcomer_limit,
               "grid": {"merge": grid.merge, "attach": grid.attach, "min_eye_distance": grid.eye, "cluster_merge": grid.cluster,
-                       "attach_margin": grid.margin or [base.attach_margin], "attach_min_ratio": grid.ratio, "settings": len(table)},
+                       "attach_margin": grid.margin or [base.attach_margin], "attach_min_ratio": grid.ratio,
+                       "cluster_min_ratio": grid.cluster_ratio or [base.cluster_min_ratio], "settings": len(table)},
               "held_out": held_out,
               "all_people": {"targets": all_people,
                              "note": "Chosen and measured on the same people: optimistic. Use the held_out numbers as the estimate."},
@@ -317,6 +318,8 @@ def add_photo_commands(commands, common) -> None:
     calibrate.add_argument("--attach-margin-grid", type=_grid, help="attach margins to try (default: --attach-margin only)")
     calibrate.add_argument("--attach-ratio-grid", type=_optional_grid, default=[None],
                            help="minimum share of the group's own mean score for an attached face; none turns the check off")
+    calibrate.add_argument("--cluster-ratio-grid", type=_optional_grid,
+                           help="minimum share of the larger cluster's own mean score for a cluster merge; none turns it off")
     calibrate.add_argument("--newcomer-limit", type=float,
                            help="largest share of a new person's faces that the attach step may put into another person's group")
     calibrate.add_argument("--top-k", type=int, default=5)

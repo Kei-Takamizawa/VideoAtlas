@@ -63,6 +63,10 @@ class GroupingPolicy:
     # larger clusters are never merged automatically; they can only become a
     # merge suggestion, so one wrong decision cannot join two whole people.
     cluster_auto_max_size: int | None = None
+    # Open-set safeguard for the cluster merge: the mean score between the two
+    # clusters must reach this share of the larger cluster's own mean pair
+    # score, so small pieces of a look-alike person are not absorbed one by one.
+    cluster_min_ratio: float | None = None
     suggest_threshold: float | None = None
     max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
@@ -91,8 +95,9 @@ class GroupingPolicy:
             raise ValueError("min_group_size must be at least 2 and attach_top_k at least 1")
         if not all(math.isfinite(value) for value in (self.merge_threshold, self.attach_margin, self.min_eye_distance)):
             raise ValueError("thresholds must be finite")
-        if self.attach_min_ratio is not None and not math.isfinite(self.attach_min_ratio):
-            raise ValueError("attach_min_ratio must be finite")
+        for name in ("attach_min_ratio", "cluster_min_ratio"):
+            if getattr(self, name) is not None and not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
 
     def to_json(self) -> dict:
         return {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(self).items()}
@@ -335,7 +340,8 @@ class ClusterSums:
 
 
 def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray, min_size: int,
-                   floor: float | None, max_smaller: int | None = None) -> tuple[np.ndarray, list[tuple[int, int, float]]]:
+                   floor: float | None, max_smaller: int | None = None,
+                   min_ratio: float | None = None) -> tuple[np.ndarray, list[tuple[int, int, float]]]:
     """Greedily merge the cluster pair with the highest normalized score, down to ``floor``.
 
     Returns the cluster index of every item and the merges in order. The order
@@ -343,7 +349,9 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
     is applied by taking the merges before the first one below it. Clusters
     smaller than ``min_size`` never take part, so only larger ones are scored.
     With ``max_smaller``, a pair whose smaller cluster has more items than
-    that is never merged.
+    that is never merged. With ``min_ratio``, a pair is merged only when the
+    mean score between the clusters is at least that share of the larger
+    cluster's own mean pair score.
     """
     _, cluster_of, counts = np.unique(labels, return_inverse=True, return_counts=True)
     cluster_of = cluster_of.reshape(-1)
@@ -362,6 +370,17 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
         scores[np.minimum.outer(sizes, sizes) > max_smaller] = -math.inf
     with np.errstate(divide="ignore", invalid="ignore"):
         within = (np.diag(sums.cross) - sums.diagonal) / (sizes * (sizes - 1))
+
+    def member_ratio_ok(index: int | None) -> np.ndarray:
+        """Pairs (all, or one row) whose cross mean reaches min_ratio of the larger cluster's own mean."""
+        rows = np.arange(count) if index is None else np.asarray([index])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cross_mean = sums.cross[rows] / np.outer(sizes[rows], sizes)
+            larger = np.where(sizes[rows][:, None] >= sizes[None, :], within[rows][:, None], within[None, :])
+            return (larger > 0) & (cross_mean >= min_ratio * larger)
+
+    if min_ratio is not None:
+        scores[~member_ratio_ok(None)] = -math.inf
     # Best partner of every cluster, so each step needs no search over all pairs.
     best_index = np.argmax(scores, axis=1)
     best_value = scores[np.arange(count), best_index]
@@ -390,6 +409,8 @@ def merge_clusters(similarity: np.ndarray, constraints: np.ndarray, labels: np.n
         allowed = active & (sizes >= min_size) & (within > 0) & ~sums.blocked[keep] & np.isfinite(row)
         if max_smaller is not None:
             allowed &= np.minimum(sizes[keep], sizes) <= max_smaller
+        if min_ratio is not None:
+            allowed &= member_ratio_ok(keep)[0]
         if not within[keep] > 0:
             allowed[:] = False
         row[~allowed] = -math.inf
@@ -428,7 +449,7 @@ def stage_two(similarity: np.ndarray, constraints: np.ndarray, local_labels: np.
     if policy.cluster_merge_threshold is None or not len(local_labels):
         return local_labels
     cluster_of, merges = merge_clusters(similarity, constraints, local_labels, policy.cluster_min_size, policy.cluster_merge_threshold,
-                                        policy.cluster_auto_max_size)
+                                        policy.cluster_auto_max_size, policy.cluster_min_ratio)
     return apply_cluster_merges(cluster_of, merges, policy.cluster_merge_threshold)
 
 

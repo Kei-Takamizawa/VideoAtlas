@@ -332,9 +332,13 @@ def test_analyze_folder_then_calibrate_and_group_from_the_command_line(tmp_path)
     assert cli.main(["photos", "calibrate", str(run_folder), "--models", "fake", "--output", str(tmp_path / "calibration-c.json"),
                      "--policy-output", str(tmp_path / "policy-c.json"), "--merge-grid", "0.5:0.9:0.2", "--attach-grid", "none",
                      "--eye-grid", "0", "--targets", "0", "--policy-target", "0", "--exclude-people", "B", "--skip-held-out",
-                     "--attach-margin-grid", "0.05,0.5", "--attach-ratio-grid", "none,0.5", "--newcomer-limit", "0.1"]) == 0
+                     "--attach-margin-grid", "0.05,0.5", "--attach-ratio-grid", "none,0.5", "--newcomer-limit", "0.1",
+                     "--cluster-grid", "none,0.5", "--cluster-ratio-grid", "none,0.6"]) == 0
     assert json.loads((tmp_path / "calibration-c.json").read_text())["held_out"] is None
-    assert json.loads((tmp_path / "calibration-c.json").read_text())["newcomer_limit"] == 0.1
+    calibration_c = json.loads((tmp_path / "calibration-c.json").read_text())
+    assert calibration_c["newcomer_limit"] == 0.1 and calibration_c["grid"]["cluster_min_ratio"] == [None, 0.6]
+    # merge 3 values x (cluster off + cluster on with two ratios) x attach off
+    assert calibration_c["grid"]["settings"] == 9
     assert json.loads((tmp_path / "policy-c.json").read_text())["calibration"]["excluded_people"] == ["B"]
     assert cli.main(["photos", "strangers", str(run_folder), "--policy", str(tmp_path / "policy.json"), "--people", "B", "--keep", "1",
                      "--repeats", "2", "--output", str(tmp_path / "strangers.json")]) == 0
@@ -468,7 +472,7 @@ def test_cluster_sums_match_brute_force():
     assert np.allclose(sums.diagonal, [np.diag(similarity)[labels == value].sum() for value in sums.values], atol=1e-5)
 
 
-def reference_merge_clusters(similarity, constraints, labels, min_size, floor, cap=None):
+def reference_merge_clusters(similarity, constraints, labels, min_size, floor, cap=None, ratio=None):
     """Recompute every cluster pair score after each merge (slow, obviously correct)."""
     from videoatlas.photo_grouping import ClusterSums
     _, cluster_of, counts = np.unique(labels, return_inverse=True, return_counts=True)
@@ -482,6 +486,13 @@ def reference_merge_clusters(similarity, constraints, labels, min_size, floor, c
         scores[:, ~active] = -math.inf
         if cap is not None:
             scores[np.minimum.outer(sums.sizes, sums.sizes) > cap] = -math.inf
+        if ratio is not None:
+            sizes = sums.sizes.astype(np.float64)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                within = (np.diag(sums.cross) - sums.diagonal) / (sizes * (sizes - 1))
+                cross_mean = sums.cross / np.outer(sizes, sizes)
+            larger = np.where(sizes[:, None] >= sizes[None, :], within[:, None], within[None, :])
+            scores[~((larger > 0) & (cross_mean >= ratio * larger))] = -math.inf
         left, right = divmod(int(np.argmax(scores)), count)
         if not scores[left, right] >= floor:
             break
@@ -510,9 +521,9 @@ def test_incremental_cluster_merge_matches_full_recompute(seed):
     for a, b in generator.integers(0, 120, size=(15, 2)):
         if a != b:
             blocked[a, b] = blocked[b, a] = True
-    for min_size, cap in ((2, None), (3, None), (2, 6)):
-        _, merges = merge_clusters(similarity, blocked, labels, min_size, -0.5, cap)
-        expected = reference_merge_clusters(similarity, blocked, labels, min_size, -0.5, cap)
+    for min_size, cap, ratio in ((2, None, None), (3, None, None), (2, 6, None), (2, None, .3), (2, 8, .2)):
+        _, merges = merge_clusters(similarity, blocked, labels, min_size, -0.5, cap, ratio)
+        expected = reference_merge_clusters(similarity, blocked, labels, min_size, -0.5, cap, ratio)
         assert [merge[:2] for merge in merges] == [merge[:2] for merge in expected]
         assert np.allclose([merge[2] for merge in merges], [merge[2] for merge in expected], atol=1e-9)
         assert len(merges) > 5
@@ -678,3 +689,30 @@ def test_calibration_estimates_newcomers_and_respects_the_newcomer_limit():
     assert all(metrics["newcomer"]["faces"] == 42 for _, metrics in table)
     chosen, _ = pick(table, 1.0, max_newcomer_rate=.05)
     assert chosen.attach_threshold in (None, .9)
+
+
+def test_cluster_ratio_keeps_pieces_of_a_look_alike_out_of_a_big_group():
+    count = 30
+    similarity = np.zeros((count, count), np.float32)
+    big = np.arange(0, 20)
+    halves = (big[:10], big[10:])
+    for half in halves:
+        similarity[np.ix_(half, half)] = .8
+    similarity[np.ix_(halves[0], halves[1])] = similarity[np.ix_(halves[1], halves[0])] = .5
+    own_piece, look_alike = np.arange(20, 24), np.arange(24, 28)
+    similarity[np.ix_(own_piece, own_piece)] = similarity[np.ix_(look_alike, look_alike)] = .9
+    similarity[np.ix_(own_piece, big)] = similarity[np.ix_(big, own_piece)] = .55      # like a typical member
+    similarity[np.ix_(look_alike, halves[0])] = similarity[np.ix_(halves[0], look_alike)] = .75  # close to a few only
+    similarity[np.ix_(look_alike, halves[1])] = similarity[np.ix_(halves[1], look_alike)] = -.2
+    np.fill_diagonal(similarity, 1.0)
+    labels = np.asarray([0] * 20 + [1] * 4 + [2] * 4 + [3, 4])
+    blocked = np.zeros((count, count), bool)
+    within_big = (similarity[np.ix_(big, big)].sum() - 20) / (20 * 19)
+    _, merges = merge_clusters(similarity, blocked, labels, 2, .2)
+    assert {frozenset(merge[:2]) for merge in merges} >= {frozenset((0, 1)), frozenset((0, 2))}
+    _, merges = merge_clusters(similarity, blocked, labels, 2, .2, min_ratio=.6)
+    joined = {frozenset(merge[:2]) for merge in merges}
+    assert frozenset((0, 1)) in joined and frozenset((0, 2)) not in joined
+    assert .55 / within_big >= .6 > .275 / within_big
+    policy = GroupingPolicy(("m",), merge_threshold=.0, cluster_merge_threshold=.2, cluster_min_size=2, cluster_min_ratio=.6)
+    assert GroupingPolicy.from_json(policy.to_json()).cluster_min_ratio == .6
