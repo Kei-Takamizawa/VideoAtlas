@@ -24,7 +24,10 @@ evaluation on labelled photos chooses them (see ``photo_evaluation``).
    ``leftover_merge_threshold``. Clusters of at least ``leftover_min_size``
    faces become new groups, marked so the user can check them. A person who
    appears in only a few photos can get a group this way, without being
-   attached to anyone else's.
+   attached to anyone else's. With ``leftover_max_known_score``, a cluster
+   that is as close to an existing group as two pieces of one person usually
+   are stays in review instead, because it is more likely hard photos of a
+   known person (or a look-alike) than a new person.
 6. Suggestions: group pairs whose normalized score reaches
    ``suggest_threshold`` are listed for the user to confirm or reject.
 
@@ -77,6 +80,9 @@ class GroupingPolicy:
     # no group took, and the smallest cluster that becomes a group.
     leftover_merge_threshold: float | None = None
     leftover_min_size: int = 3
+    # A leftover cluster whose cluster score (cross mean / sqrt(own mean x group
+    # mean)) to any existing group reaches this value does not become a group.
+    leftover_max_known_score: float | None = None
     suggest_threshold: float | None = None
     max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
@@ -107,7 +113,7 @@ class GroupingPolicy:
             raise ValueError("min_group_size must be at least 2 and attach_top_k at least 1")
         if not all(math.isfinite(value) for value in (self.merge_threshold, self.attach_margin, self.min_eye_distance)):
             raise ValueError("thresholds must be finite")
-        for name in ("attach_min_ratio", "cluster_min_ratio", "leftover_merge_threshold"):
+        for name in ("attach_min_ratio", "cluster_min_ratio", "leftover_merge_threshold", "leftover_max_known_score"):
             if getattr(self, name) is not None and not math.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
 
@@ -553,19 +559,66 @@ def leftover_merges(similarity: np.ndarray, constraints: np.ndarray, faces: np.n
     return agglomerate(block, square_block(constraints, faces), linkage, floor, overwrite=block is not similarity)
 
 
+def existing_group_scores(similarity: np.ndarray, labels: np.ndarray, faces: np.ndarray,
+                          group_count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Mean score of each given face to each existing group, and each group's own mean pair score."""
+    grouped = np.flatnonzero(labels != UNGROUPED)
+    by_group = grouped[np.argsort(labels[grouped], kind="stable")]
+    members = np.split(by_group, np.cumsum(np.bincount(labels[grouped], minlength=group_count))[:-1]) if group_count else []
+    if not group_count:
+        return np.zeros((len(faces), 0)), np.zeros(0)
+    return group_means(similarity, faces, members)
+
+
+def known_cluster_scores(similarity: np.ndarray, faces: np.ndarray, known: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    """Cluster score of a set of leftover faces to every existing group; -inf where a mean is not positive.
+
+    ``known`` holds the faces' rows of ``existing_group_scores`` and the
+    groups' own means. The score is the stage-two cluster merge score.
+    """
+    means, within_groups = known
+    if not means.shape[1]:
+        return np.zeros(0)
+    block = np.asarray(similarity[np.ix_(faces, faces)], np.float64)
+    within = (block.sum() - np.trace(block)) / (len(faces) * (len(faces) - 1)) if len(faces) > 1 else math.nan
+    cross = means.mean(axis=0)
+    with np.errstate(invalid="ignore"):
+        scores = cross / np.sqrt(within * within_groups)
+    scores[~np.isfinite(scores) | ~(within_groups > 0) | ~(within > 0)] = -math.inf
+    return scores
+
+
 def add_leftover_groups(labels: np.ndarray, faces: np.ndarray, merges: list[tuple[int, int, float]], threshold: float,
-                        min_size: int, group_count: int) -> tuple[np.ndarray, list[int]]:
-    """New group indexes, after ``group_count`` and largest first, for leftover clusters of ``min_size`` or more faces."""
+                        min_size: int, group_count: int, max_known_score: float | None = None,
+                        similarity: np.ndarray | None = None,
+                        known: tuple[np.ndarray, np.ndarray] | None = None) -> tuple[np.ndarray, list[int]]:
+    """New group indexes, after ``group_count`` and largest first, for leftover clusters of ``min_size`` or more faces.
+
+    With ``max_known_score``, ``similarity`` and ``known`` (the faces' rows of
+    ``existing_group_scores``) are needed; a cluster that close to an existing
+    group stays ungrouped.
+    """
     labels = labels.copy()
     if not len(faces):
         return labels, []
     local = cut(merges, len(faces), threshold)
     unique, inverse, sizes = np.unique(local, return_inverse=True, return_counts=True)
+    inverse = inverse.reshape(-1)
     order = np.lexsort((unique, -sizes))
     big = order[sizes[order] >= min_size]
+    if max_known_score is not None and len(big):
+        if similarity is None or known is None:
+            raise ValueError("max_known_score needs the similarity matrix and the existing-group scores")
+        keep = []
+        for cluster in big:
+            positions = np.flatnonzero(inverse == cluster)
+            scores = known_cluster_scores(similarity, faces[positions], (known[0][positions], known[1]))
+            if not (len(scores) and scores.max() >= max_known_score):
+                keep.append(cluster)
+        big = np.asarray(keep, np.int64)
     index_of = np.full(len(unique), UNGROUPED, np.int64)
     index_of[big] = group_count + np.arange(len(big))
-    labels[faces] = index_of[inverse.reshape(-1)]
+    labels[faces] = index_of[inverse]
     return labels, list(range(group_count, group_count + len(big)))
 
 
@@ -628,8 +681,11 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
     if policy.leftover_merge_threshold is not None:
         pool = np.flatnonzero((labels == UNGROUPED) & ~gated)
         merges = leftover_merges(similarity, constraints, pool, policy.leftover_merge_threshold, policy.linkage)
+        known = existing_group_scores(similarity, labels, pool, group_count) \
+            if policy.leftover_max_known_score is not None else None
         labels, new_groups = add_leftover_groups(labels, pool, merges, policy.leftover_merge_threshold,
-                                                 policy.leftover_min_size, group_count)
+                                                 policy.leftover_min_size, group_count, policy.leftover_max_known_score,
+                                                 similarity, known)
         group_count += len(new_groups)
     remaining = np.flatnonzero(labels[leftovers] == UNGROUPED)
     # Review candidates come from the groups formed before the attach step only.

@@ -131,7 +131,18 @@ One problem remains. A newcomer rarely gets a group of their own: with 30 photos
 
 ## New groups from leftover faces (in progress)
 
-An optional step clusters the faces that no group took among themselves, with average linkage at a lower threshold (`leftover_merge_threshold`), and keeps clusters of at least `leftover_min_size` faces as new groups. The groups file marks them with `from_leftovers`, so the user can check them first. `Scripts/sweep_leftover_groups.py` compares settings on the development people: mixing and missing for known people, and the newcomer test with 1, 3, 10 and 30 photos kept. Results will be added here.
+An optional step clusters the faces that no group took among themselves, with average linkage at a lower threshold (`leftover_merge_threshold`), and keeps clusters of at least `leftover_min_size` faces as new groups. The groups file marks them with `from_leftovers`, so the user can check them first. `Scripts/sweep_leftover_groups.py` compares settings on the development people: mixing and missing for known people, and the newcomer test with 1, 3, 10 and 30 photos kept.
+
+First sweep (18 development people, test labels hidden; newcomer columns in % of kept faces, own group / another person's group / unlabelled group):
+
+| Threshold, min size | Known people: mixed faces | 1 photo kept | 3 kept | 10 kept | 30 kept |
+| --- | --- | --- | --- | --- | --- |
+| off | 2 | 0 / 0 / 0 | 1.2 / 0 / 0 | 0 / 0.6 / 0.4 | 2.2 / 0.6 / 0.1 |
+| 5.0, 2 | 2 | 0 / 3.7 / 22.2 | 22.2 / 5.6 / 24.1 | 41.5 / 4.3 / 20.4 | 52.7 / 5.9 / 18.6 |
+| 6.0, 2 | 2 | 0 / 1.9 / 1.9 | 7.4 / 3.7 / 6.2 | 25.0 / 2.2 / 4.1 | 41.0 / 2.7 / 3.5 |
+| 7.0, 2 | 2 | 0 / 0 / 0 | 2.5 / 0.6 / 1.9 | 3.7 / 0.9 / 0.9 | 14.2 / 0.6 / 0.8 |
+
+Known people were not affected at 3.5 and above (no mixed face in a new group). For newcomers the step works, but it also puts more of them in a group with other faces. "Unlabelled group" counts as wrong here, although the unlabelled faces can be the same newcomer seen in group photos of other folders. Two changes are being tested next: a check that keeps a leftover cluster out when it is about as close to an existing group as two pieces of one person usually are (`leftover_max_known_score`), and an estimate of who the unlabelled faces are (the labelled person with the highest mean score; a rough estimate from the same models, not an answer key).
 
 ## Limits of this evidence
 

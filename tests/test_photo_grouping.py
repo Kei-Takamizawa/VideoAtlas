@@ -805,3 +805,54 @@ def test_leftover_sweep_reports_mixing_and_missing_per_setting():
     assert rows[1]["review_faces"] == 48 - rows[1]["leftover_groups"]["faces"]
     assert rows[2]["groups"] == 1 and rows[2]["mixed_faces"] == 36 and rows[2]["leftover_groups"]["mixed_faces"] == 36
     assert rows[2]["mixed_groups"][0]["from_leftovers"] is True
+
+
+def test_leftover_cluster_close_to_a_known_group_stays_in_review():
+    from videoatlas.photo_grouping import existing_group_scores, finish_grouping
+    count = 24
+    similarity = np.zeros((count, count), np.float32)
+    known, hard, newcomer = np.arange(0, 10), np.arange(10, 13), np.arange(13, 17)
+    similarity[np.ix_(known, known)] = .8
+    similarity[np.ix_(hard, hard)] = .6                     # hard photos of the known person
+    similarity[np.ix_(hard, known)] = similarity[np.ix_(known, hard)] = .45
+    similarity[np.ix_(newcomer, newcomer)] = .55
+    similarity[np.ix_(newcomer, known)] = similarity[np.ix_(known, newcomer)] = .05
+    np.fill_diagonal(similarity, 1.0)
+    run = make_run([1] * count, np.eye(count))
+    constraints = same_photo_constraints(run.face_photo)
+    local = np.asarray([0] * 10 + list(range(1, 15)))
+    policy = GroupingPolicy(("m",), merge_threshold=.7, attach_threshold=.6, leftover_merge_threshold=.5, leftover_min_size=3)
+    result = finish_grouping(run, policy, similarity, constraints, np.arange(count), local)
+    assert result.leftover_groups == [1, 2] and result.group_sizes == [10, 4, 3]
+    capped = replace(policy, leftover_max_known_score=.4)       # hard: .45 / sqrt(.6 * .8) = .65; newcomer: .08
+    result = finish_grouping(run, capped, similarity, constraints, np.arange(count), local)
+    assert result.leftover_groups == [1] and result.group_sizes == [10, 4]
+    assert set(result.labels[newcomer]) == {1} and (result.labels[hard] == UNGROUPED).all()
+    assert GroupingPolicy.from_json(capped.to_json()).leftover_max_known_score == .4
+    empty = existing_group_scores(similarity, np.full(count, UNGROUPED), hard, 0)
+    assert empty[0].shape == (3, 0) and empty[1].shape == (0,)
+
+
+def test_stranger_test_explains_groups_of_unlabelled_faces():
+    from videoatlas.photo_evaluation import leftover_sweep, stranger_test
+    generator = np.random.default_rng(7)
+    centers = unit(generator.normal(size=(4, 32)))
+    labels = [person for person in "ABCD" for _ in range(12)]
+    single = [centers[index] + .15 * generator.normal(size=32) for index in range(4) for _ in range(12)]
+    pairs = [vector for _ in range(4) for vector in (centers[2] + .15 * generator.normal(size=32),
+                                                     centers[0] + .15 * generator.normal(size=32))]
+    run = make_run([1] * 48 + [2] * 4, np.stack(single + pairs), labels=labels + ["C"] * 4)  # A also appears in C's pair photos
+    similarity = run.embeddings["m"] @ run.embeddings["m"].T
+    middle = float((similarity[:12, :12].mean() + similarity[:12, 12:48].mean()) / 2)
+    policy = GroupingPolicy(("m",), merge_threshold=.99, leftover_merge_threshold=middle, leftover_min_size=2)
+    entry = stranger_test(run, policy, ["A"], keep_sizes=(4,), repeats=1, batch=1, seed=0, likely_lead=.2)["keep"]["4"]
+    assert entry["unlabelled_group"] == 4 and entry["unlabelled_group_likely_same_person"] == 4
+    assert entry["wrong_in_new_groups"] == 4
+    detail = entry["wrong"][0]
+    assert detail["from_leftovers"] and detail["same_person_faces"] == 4 and detail["unlabelled_others"] == 4
+    assert detail["unlabelled_likely_people"] == {"A": 4} and detail["labelled_others"] == {}
+    grid = stranger_test(run, replace(policy, leftover_merge_threshold=None), ["A"], keep_sizes=(4,), repeats=1, batch=1, seed=0,
+                         leftover_grid=[(middle, 2), (middle, 2, -1.0)])["keep"]["4"]["leftover_grid"]
+    assert grid[0]["unlabelled_group"] == 4 and grid[1]["leftover_max_known_score"] == -1.0
+    rows = leftover_sweep(run, policy, [(middle, 2, None), (middle, 2, -1.0)], people=["B"])
+    assert rows[1]["leftover_max_known_score"] is None and rows[2]["leftover_max_known_score"] == -1.0

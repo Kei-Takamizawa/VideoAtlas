@@ -29,8 +29,8 @@ from typing import Iterable
 import numpy as np
 
 from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, add_leftover_groups, agglomerate, apply_cluster_merges, cut, \
-    finish_grouping, fused_similarity, gate_mask, group_faces, group_means, initial_groups, leftover_merges, mean_ratios, \
-    merge_clusters, same_photo_constraints, square_block, top_k_means
+    existing_group_scores, finish_grouping, fused_similarity, gate_mask, group_faces, group_means, initial_groups, \
+    known_cluster_scores, leftover_merges, mean_ratios, merge_clusters, same_photo_constraints, square_block, top_k_means
 from .photos import RunData
 
 FMR_TARGETS = (1e-2, 1e-3, 1e-4)
@@ -734,6 +734,64 @@ def _quantiles(values: list[float]) -> dict:
             "max": round(float(data.max()), 4), "count": int(data.size)}
 
 
+def leftover_setting(item) -> tuple[float, int, float | None]:
+    """(threshold, minimum size, known-group score limit or None) from a 2- or 3-item setting."""
+    threshold, min_size, cap = (*tuple(item), None)[:3]
+    if int(min_size) < 2:
+        raise ValueError("leftover minimum sizes must be at least 2")
+    return float(threshold), int(min_size), None if cap is None else float(cap)
+
+
+def _policy_setting(policy: GroupingPolicy) -> list[tuple[float, int, float | None]]:
+    if policy.leftover_merge_threshold is None:
+        return []
+    return [leftover_setting((policy.leftover_merge_threshold, policy.leftover_min_size, policy.leftover_max_known_score))]
+
+
+def _apply_leftover_settings(result: GroupingResult, similarity: np.ndarray, face_photo: np.ndarray,
+                             settings: list[tuple[float, int, float | None]], linkage: str) -> dict:
+    """Group labels for each leftover setting, from one grouping without the leftover step."""
+    leftover = np.flatnonzero((result.labels == UNGROUPED) & ~result.gated)
+    if not settings:
+        return {}
+    leftover_similarity = square_block(similarity, leftover)
+    merges = leftover_merges(leftover_similarity, same_photo_constraints(np.asarray(face_photo)[leftover]),
+                             np.arange(len(leftover)), min(setting[0] for setting in settings), linkage)
+    del leftover_similarity
+    count = len(result.group_sizes)
+    known = existing_group_scores(similarity, result.labels, leftover, count) \
+        if any(setting[2] is not None for setting in settings) else None
+    return {setting: add_leftover_groups(result.labels, leftover, merges, setting[0], setting[1], count, setting[2],
+                                         similarity, known)
+            for setting in settings}
+
+
+class _LikelyPerson:
+    """Estimated person for unlabelled faces: the labelled person with the highest mean score, by a clear lead.
+
+    It uses the same models as the grouping, so it is a rough estimate, not an answer key.
+    """
+
+    def __init__(self, run: RunData, policy: GroupingPolicy, key: np.ndarray, lead: float = 1.0) -> None:
+        self.people = sorted({label for label in key if label is not None})
+        weights = policy.weights or (1.0,) * len(policy.models)
+        offsets = policy.offsets or (0.0,) * len(policy.models)
+        scales = policy.scales or (1.0,) * len(policy.models)
+        self.parts = [(run.embeddings[name], np.stack([run.embeddings[name][key == person].mean(axis=0) for person in self.people]),
+                       offset, weight / scale / sum(weights)) for name, weight, offset, scale in zip(policy.models, weights, offsets, scales)]
+        self.lead = lead
+
+    def __call__(self, rows: np.ndarray) -> list[str | None]:
+        if not len(rows) or not self.people:
+            return [None] * len(rows)
+        total = sum(factor * (np.asarray(vectors[rows], np.float64) @ means.T - offset) for vectors, means, offset, factor in self.parts)
+        if total.shape[1] == 1:
+            return [self.people[0]] * len(rows)
+        top = np.sort(total, axis=1)[:, -2:]
+        best = np.argmax(total, axis=1)
+        return [self.people[int(index)] if gap >= self.lead else None for index, gap in zip(best, top[:, 1] - top[:, 0])]
+
+
 def _stranger_outcomes(labels: np.ndarray, own: dict[int, str], key: np.ndarray) -> tuple[dict[int, list[int]], dict[int, tuple]]:
     """Each kept face's outcome, the majority label of its group, and its group; also each group's members."""
     members_of: dict[int, list[int]] = defaultdict(list)
@@ -765,7 +823,7 @@ def _outcome_rates(counts: Counter) -> dict:
 
 def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], keep_sizes: Iterable[int] = (1, 3),
                   repeats: int = 3, batch: int = 5, seed: int = 0,
-                  leftover_grid: Iterable[tuple[float, int]] = ()) -> dict:
+                  leftover_grid: Iterable[tuple] = (), likely_lead: float = 1.0) -> dict:
     """How often a person with only a few photos is put into a group of other people.
 
     Real collections keep adding people who appear in only one or a few
@@ -778,11 +836,17 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
     conservative: a group of unlabelled faces can be the same person seen in
     another person's group photo.
 
-    ``leftover_grid`` lists (threshold, minimum size) settings for new groups
-    from leftover faces. Each is scored on the same batches, by outcome counts
-    only, after the policy's other steps.
+    ``leftover_grid`` lists (threshold, minimum size[, known-group score
+    limit]) settings for new groups from leftover faces. Each is scored on the
+    same batches, by outcome counts only, after the policy's other steps.
+
+    Each wrong placement lists who else is in the group. Unlabelled faces get
+    an estimated person (``_LikelyPerson``, lead ``likely_lead``), which shows
+    whether a group of unlabelled faces is probably the newcomer seen in other
+    photos. That estimate uses the same models, so it is not an answer key.
     """
     focus = sorted(set(people))
+    grid = [leftover_setting(item) for item in leftover_grid]
     unknown = set(focus) - {_known_label(photo) for photo in run.photos}
     if unknown:
         raise ValueError(f"No labelled photos for: {', '.join(sorted(unknown))}")
@@ -807,14 +871,13 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
     sizes = sorted(set(int(size) for size in keep_sizes))
     if not sizes or sizes[0] < 1 or batch < 1 or repeats < 1:
         raise ValueError("keep sizes, batch and repeats must be at least 1")
-    grid = [(float(threshold), int(min_size)) for threshold, min_size in leftover_grid]
-    if any(min_size < 2 for _, min_size in grid):
-        raise ValueError("leftover minimum sizes must be at least 2")
-    own_setting = [(policy.leftover_merge_threshold, policy.leftover_min_size)] if policy.leftover_merge_threshold is not None else []
+    own_setting = _policy_setting(policy)
     base_policy = replace(policy, leftover_merge_threshold=None) if grid else policy
+    likely = _LikelyPerson(run, policy, key, likely_lead)
     report = {"method": stranger_test.__doc__.split("\n\n")[0].strip(), "people": focus, "repeats": repeats, "batch": batch,
               "seed": seed, "attach_threshold": policy.attach_threshold, "leftover_merge_threshold": policy.leftover_merge_threshold,
-              "leftover_min_size": policy.leftover_min_size, "keep": {}}
+              "leftover_min_size": policy.leftover_min_size, "leftover_max_known_score": policy.leftover_max_known_score,
+              "keep": {}}
     for size in sizes:
         counts = Counter()
         grid_counts = {setting: Counter() for setting in grid}
@@ -837,16 +900,10 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
                 labels = result.labels
                 sub_key = key[rows]
                 own = {position[row]: person for row, person in kept.items()}
+                base_groups = len(result.group_sizes) - len(result.leftover_groups)
                 if grid:
-                    leftover = np.flatnonzero((result.labels == UNGROUPED) & ~result.gated)
-                    leftover_similarity = square_block(similarity, leftover)
-                    merges = leftover_merges(leftover_similarity, same_photo_constraints(np.asarray(sub.face_photo)[leftover]),
-                                             np.arange(len(leftover)), min(threshold for threshold, _ in grid + own_setting),
-                                             policy.linkage)
-                    del leftover_similarity
-                    for setting in grid + own_setting:
-                        new_labels = add_leftover_groups(result.labels, leftover, merges, setting[0], setting[1],
-                                                         len(result.group_sizes))[0]
+                    for setting, (new_labels, _) in _apply_leftover_settings(result, similarity, sub.face_photo, grid + own_setting,
+                                                                             policy.linkage).items():
                         if setting in grid_counts:
                             grid_counts[setting].update(outcome for outcome, _, _ in _stranger_outcomes(new_labels, own, sub_key)[1].values())
                         if setting in own_setting:
@@ -873,15 +930,38 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
                         leads.append(lead)
                         ratios.append(ratio)
                     if outcome in ("other_person_group", "unlabelled_group"):
-                        details.append({"person": person, "outcome": outcome, "group_majority": majority, "group_size": len(members_of[group]),
-                                        "attached": bool(result.attached[index]),
-                                        "best_other_group_score": None if best[0] is None else round(best[0], 4),
-                                        "lead": None if lead is None else round(lead, 4),
-                                        "mean_ratio": None if ratio is None else round(ratio, 4)})
+                        others = [member for member in members_of[group] if own.get(member) != person]
+                        unlabelled = [member for member in others if sub_key[member] is None]
+                        guesses = Counter(likely(rows[np.asarray(unlabelled, np.int64)]))
+                        entry = {"person": person, "outcome": outcome, "group_majority": majority, "group_size": len(members_of[group]),
+                                 "attached": bool(result.attached[index]), "from_leftovers": group >= base_groups,
+                                 "same_person_faces": len(members_of[group]) - len(others),
+                                 "labelled_others": dict(Counter(sub_key[member] for member in others
+                                                                 if sub_key[member] is not None).most_common(3)),
+                                 "unlabelled_others": len(unlabelled), "unlabelled_likely_same_person": guesses.get(person, 0),
+                                 "unlabelled_likely_people": {str(name): count for name, count in guesses.most_common(3)},
+                                 "best_other_group_score": None if best[0] is None else round(best[0], 4),
+                                 "lead": None if lead is None else round(lead, 4),
+                                 "mean_ratio": None if ratio is None else round(ratio, 4)}
+                        if group >= base_groups and base_groups:
+                            existing = np.where(labels < base_groups, labels, UNGROUPED)
+                            group_rows = np.asarray(members_of[group], np.int64)
+                            scores = known_cluster_scores(similarity, group_rows,
+                                                          existing_group_scores(similarity, existing, group_rows, base_groups))
+                            nearest = int(np.argmax(scores))
+                            entry["known_score"] = round(float(scores[nearest]), 4)
+                            entry["nearest_group_majority"] = Counter(sub_key[member] for member in np.flatnonzero(existing == nearest)
+                                                                      if sub_key[member] is not None).most_common(1)[0][0] \
+                                if any(sub_key[member] is not None for member in np.flatnonzero(existing == nearest)) else None
+                        details.append(entry)
                 del similarity, result, sub, labels
         values = np.asarray(best_scores)
         report["keep"][str(size)] = {**_outcome_rates(counts),
                                      "wrong_by_attach": sum(1 for item in details if item["attached"]),
+                                     "wrong_in_new_groups": sum(1 for item in details if item["from_leftovers"]),
+                                     "unlabelled_group_likely_same_person": sum(
+                                         1 for item in details if item["outcome"] == "unlabelled_group"
+                                         and item["unlabelled_likely_same_person"] * 2 > item["unlabelled_others"]),
                                      "best_score_in_another_group": _quantiles(best_scores),
                                      "lead_over_second_group": _quantiles(leads),
                                      "mean_ratio_to_best_group": _quantiles(ratios),
@@ -889,9 +969,9 @@ def stranger_test(run: RunData, policy: GroupingPolicy, people: Iterable[str], k
                                      else _ratio(int(np.sum(values >= policy.attach_threshold)), int(values.size)),
                                      "wrong": details}
         if grid:
-            report["keep"][str(size)]["leftover_grid"] = [{"leftover_merge_threshold": threshold, "leftover_min_size": min_size,
-                                                           **_outcome_rates(grid_counts[(threshold, min_size)])}
-                                                          for threshold, min_size in grid]
+            report["keep"][str(size)]["leftover_grid"] = [{"leftover_merge_threshold": setting[0], "leftover_min_size": setting[1],
+                                                           "leftover_max_known_score": setting[2], **_outcome_rates(grid_counts[setting])}
+                                                          for setting in grid]
     return report
 
 
@@ -904,28 +984,22 @@ def leftover_sweep(run: RunData, policy: GroupingPolicy, settings: Iterable[tupl
     (threshold, minimum size) setting. Labels hidden with ``hide_labels`` stay
     hidden.
     """
-    settings = [(float(threshold), int(min_size)) for threshold, min_size in settings]
-    if any(min_size < 2 for _, min_size in settings):
-        raise ValueError("leftover minimum sizes must be at least 2")
+    settings = [leftover_setting(item) for item in settings]
     base_policy = replace(policy, leftover_merge_threshold=None, suggest_threshold=None)
     similarity = fused_similarity(run.embeddings, policy)
     base = group_faces(run, base_policy, similarity=similarity)
     labels, photos = face_labels(run), photo_labels(run)
     leftover = np.flatnonzero((base.labels == UNGROUPED) & ~base.gated)
-    merges = []
-    if settings:
-        leftover_similarity = square_block(similarity, leftover)
-        merges = leftover_merges(leftover_similarity, same_photo_constraints(np.asarray(run.face_photo)[leftover]),
-                                 np.arange(len(leftover)), min(threshold for threshold, _ in settings), policy.linkage)
-        del leftover_similarity
+    applied = _apply_leftover_settings(base, similarity, run.face_photo, settings, policy.linkage)
     del similarity
     rows = []
     for setting in [None] + settings:
         result = base
         if setting is not None:
-            new_labels, new_groups = add_leftover_groups(base.labels, leftover, merges, setting[0], setting[1], len(base.group_sizes))
+            new_labels, new_groups = applied[setting]
             grouped = {run.faces[face]["id"] for face in leftover[new_labels[leftover] != UNGROUPED]}
-            result = replace(base, policy=replace(base_policy, leftover_merge_threshold=setting[0], leftover_min_size=setting[1]),
+            result = replace(base, policy=replace(base_policy, leftover_merge_threshold=setting[0], leftover_min_size=setting[1],
+                                                  leftover_max_known_score=setting[2]),
                              labels=new_labels, leftover_groups=new_groups,
                              group_sizes=np.bincount(new_labels[new_labels != UNGROUPED], minlength=len(base.group_sizes) + len(new_groups))
                              .astype(int).tolist(),
@@ -933,6 +1007,7 @@ def leftover_sweep(run: RunData, policy: GroupingPolicy, settings: Iterable[tupl
         metrics = grouping_metrics(run, result, labels, people, photos=photos)
         rows.append({"leftover_merge_threshold": None if setting is None else setting[0],
                      "leftover_min_size": None if setting is None else setting[1],
+                     "leftover_max_known_score": None if setting is None else setting[2],
                      "groups": metrics["groups"], "review_faces": metrics["review_faces"],
                      "mixed_faces": metrics["mixing"]["mixed_faces"], "mixing_rate": metrics["mixing"]["mixing_rate"],
                      "missing_rate": metrics["missing"]["missing_rate"],
