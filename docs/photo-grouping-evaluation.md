@@ -129,7 +129,7 @@ ChaeWon and Serina now lead separate groups, and neither group holds another lab
 
 One problem remains. A newcomer rarely gets a group of their own: with 30 photos kept, only 6 of 900 kept faces were in a group of their own, and almost all others stayed in review. The first clustering step joins only near-duplicate faces, and the attach step (correctly) keeps newcomers out of other groups.
 
-## New groups from leftover faces (in progress)
+## New groups from leftover faces (2026-11-27)
 
 An optional step clusters the faces that no group took among themselves, with average linkage at a lower threshold (`leftover_merge_threshold`), and keeps clusters of at least `leftover_min_size` faces as new groups. The groups file marks them with `from_leftovers`, so the user can check them first. `Scripts/sweep_leftover_groups.py` compares settings on the development people: mixing and missing for known people, and the newcomer test with 1, 3, 10 and 30 photos kept.
 
@@ -142,7 +142,32 @@ First sweep (18 development people, test labels hidden; newcomer columns in % of
 | 6.0, 2 | 2 | 0 / 1.9 / 1.9 | 7.4 / 3.7 / 6.2 | 25.0 / 2.2 / 4.1 | 41.0 / 2.7 / 3.5 |
 | 7.0, 2 | 2 | 0 / 0 / 0 | 2.5 / 0.6 / 1.9 | 3.7 / 0.9 / 0.9 | 14.2 / 0.6 / 0.8 |
 
-Known people were not affected at 3.5 and above (no mixed face in a new group). For newcomers the step works, but it also puts more of them in a group with other faces. "Unlabelled group" counts as wrong here, although the unlabelled faces can be the same newcomer seen in group photos of other folders. Two changes are being tested next: a check that keeps a leftover cluster out when it is about as close to an existing group as two pieces of one person usually are (`leftover_max_known_score`), and an estimate of who the unlabelled faces are (the labelled person with the highest mean score; a rough estimate from the same models, not an answer key).
+Known people were not affected at 3.5 and above (no mixed face in a new group). For newcomers the step works, but it also puts more of them in a group with other faces. "Unlabelled group" counts as wrong here, although the unlabelled faces can be the same newcomer seen in group photos of other folders. Second sweep (60 settings): a check that keeps a leftover cluster out when it is about as close to an existing group as two pieces of one person usually are (`leftover_max_known_score`) removed correct new groups about as often as wrong ones, so it is not used. An estimate of who the unlabelled faces are (the labelled person with the highest mean score, by a lead of at least 1.0) suggested that 154 of 159 "unlabelled group" placements (30 photos kept) were the newcomer's own faces in other folders' group photos. The estimate uses the same models, so it is not an answer key. Real wrong placements came mostly from one look-alike pair.
+
+Third sweep: `leftover_attach` lets remaining faces join a new group under the main attach rules. It doubled the newcomers' own-group share at 30 photos (14.2% to 31.6%) but raised the share in another person's group to 3.7% / 1.9% / 2.0% / 0.7% (1 / 3 / 10 / 30 photos kept), against 0% / 0.6% / 0.6% / 0.4% without it.
+
+The user chose setting A before the final check: threshold 7.0, minimum size 2, no known-group limit, no attach to new groups (`policy-final-a.json` = `policy-dev-open2.json` plus these four fields).
+
+## Final check on 14 unused people (2026-11-27)
+
+The user added 14 labelled people (8,251 files) after all settings above were chosen. They were analyzed together with the 28 earlier people (42 people, 28,279 photos, 34,607 usable faces; 1,468 s on the GPU) and looked at once, with setting A fixed beforehand. This is the first unbiased estimate since the 8-person rounds.
+
+| People | Mixed faces | Missing photos | Notes |
+| --- | --- | --- | --- |
+| 14 unused people | 12 of 6,871 (0.17%), 4 groups | 4.81% (4.25% without photos that have no usable face) | Kumi (61 photos) misses 77%: the faces are split over 20 small groups |
+| 28 earlier people, same run | 5 of 16,849 (0.03%), 3 groups | 4.57% | |
+
+The 26 hard look-alike photos: 22 in the person's main group, 4 (SeoYeon) in two new two-face groups that hold only SeoYeon's faces, none in another person's group.
+
+The newcomer test on the 14 unused people shows a problem that the development people did not show:
+
+| Policy | 1 photo kept | 3 kept | 10 kept | 30 kept |
+| --- | --- | --- | --- | --- |
+| Without new groups (own / another person's / unlabelled, %) | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 1.0 / 11.7 / 6.9 | 3.5 / 14.9 / 8.6 |
+| Setting A | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 5.7 / 11.7 / 6.9 | 14.7 / 14.9 / 8.6 |
+
+Setting A works as intended: no wrong placement was in a new group, and the newcomers' own-group share at 30 photos rose from 3.5% to 14.7%. But 12% to 17% of a newcomer's faces were attached to another person's group, mostly the Juun and Yuha groups, against under 1% on the development people and 1% to 3% on the earlier test people. Several of the 14 belong to the same group of performers as each other and as three development people, and they appear in each other's group photos. The cause is being examined; after that, these 14 people are no longer unseen, and another unbiased check needs new labelled people.
+
 
 ## Limits of this evidence
 
