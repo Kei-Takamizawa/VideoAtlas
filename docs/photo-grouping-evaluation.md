@@ -166,7 +166,20 @@ The newcomer test on the 14 unused people shows a problem that the development p
 | Without new groups (own / another person's / unlabelled, %) | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 1.0 / 11.7 / 6.9 | 3.5 / 14.9 / 8.6 |
 | Setting A | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 5.7 / 11.7 / 6.9 | 14.7 / 14.9 / 8.6 |
 
-Setting A works as intended: no wrong placement was in a new group, and the newcomers' own-group share at 30 photos rose from 3.5% to 14.7%. But 12% to 17% of a newcomer's faces were attached to another person's group, mostly the Juun and Yuha groups, against under 1% on the development people and 1% to 3% on the earlier test people. Several of the 14 share photo files with each other and with three development people (Carmen, JiwooH2H, Yuha), so they appear in each other's group photos. The cause is being examined; after that, these 14 people are no longer unseen, and another unbiased check needs new labelled people.
+Setting A works as intended: no wrong placement was in a new group, and the newcomers' own-group share at 30 photos rose from 3.5% to 14.7%.
+
+The "another person's" column first looked like a large failure: 12% to 17%, mostly in groups whose labelled faces were Juun's or Yuha's. `Scripts/explain_newcomer_errors.py` showed that the test itself was misleading. The newcomer test named a group by its labelled faces only. When Ian was a newcomer, 28 of 30 kept faces went into a group of 105 faces: the 28 kept faces, about 67 faces estimated to be Ian from other folders' group photos, and only 4 labelled faces (Juun 2, Stella 2), so the test called it Juun's group. Juun as a newcomer behaved the same way, except that the group also took 16 labelled faces of Yuha (10), A-na (5) and YeonJi (1). The main Juun and Yuha groups held only their own faces in every run. The test now also counts placements whose group holds more of the newcomer's kept faces than of any labelled person:
+
+| Photos kept | Another person's group by labelled faces | Of these, group led by the newcomer | Left in a group led by another person |
+| --- | --- | --- | --- |
+| 1 | 6 of 42 (14.3%) | 0 | 14.3% |
+| 3 | 21 of 126 (16.7%) | 6 | 11.9% |
+| 10 | 49 of 420 (11.7%) | 28 | 5.0% |
+| 30 | 188 of 1,260 (14.9%) | 165 | 1.8% |
+
+With 1 or 3 photos kept, the kept faces cannot outnumber a few labelled faces, so most of these are the same kind of group (the newcomer's own group-photo faces plus a few labelled faces of someone else), going by the estimate; the estimate uses the same models and is not an answer key. On the development people the same measure is 3.7% / 1.9% / 0.6% / 0.7%.
+
+The remaining real errors are the labelled faces of known people that such newcomer groups take (for example the 16 Yuha, A-na and YeonJi faces), and a person with few photos being split into many small groups (Kumi). These 14 people are no longer unseen; another unbiased check needs new labelled people.
 
 
 ## Limits of this evidence
