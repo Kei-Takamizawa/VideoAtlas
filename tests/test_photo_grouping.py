@@ -932,3 +932,46 @@ def test_shipped_policy_loads_and_keeps_its_safeguards():
     assert policy.cluster_auto_max_size == 30 and policy.cluster_min_ratio == .5 and policy.attach_min_ratio == .6
     assert policy.leftover_merge_threshold == 7.0 and policy.leftover_min_size == 2 and not policy.leftover_attach
     assert policy.to_json() == json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_missing_breakdown_names_the_cause_of_every_missing_photo():
+    from videoatlas.photo_evaluation import missing_breakdown
+    from videoatlas.photo_grouping import GroupingResult
+    # Photos: 0-9 A main, 10-12 A fragment, 13-20 B, 21 A in B's group, 22 A in review, 23 A group photo, 24 A without a face.
+    # Photo i holds face row i up to photo 22; photo 23 holds rows 23 and 24.
+    photo_faces = [1] * 23 + [2, 0]
+    people = ["A"] * 13 + ["B"] * 8 + ["A"] * 4
+    run = make_run(photo_faces, np.eye(25), labels=people)
+    main, fragment, b_group = np.arange(10), np.arange(10, 13), np.arange(13, 22)  # face 21 is A's face in B's group
+    similarity = np.zeros((25, 25), np.float32)
+    similarity[np.ix_(main, main)] = .8
+    similarity[np.ix_(fragment, fragment)] = .7
+    similarity[np.ix_(main, fragment)] = similarity[np.ix_(fragment, main)] = .5
+    similarity[np.ix_(b_group, b_group)] = .8
+    similarity[np.ix_(main, b_group)] = similarity[np.ix_(b_group, main)] = .1
+    similarity[np.ix_(fragment, b_group)] = similarity[np.ix_(b_group, fragment)] = .1
+    np.fill_diagonal(similarity, 1.0)
+    labels = np.full(25, UNGROUPED)
+    labels[main], labels[b_group], labels[fragment] = 0, 1, 2
+    review_face = 22
+    policy = GroupingPolicy(("m",), merge_threshold=.5, attach_threshold=3.0)
+    result = GroupingResult(policy, run.face_ids, labels, [10, 9, 3], np.zeros(25, bool), np.zeros(25, bool),
+                            [{"face": run.faces[review_face]["id"], "photo": run.faces[review_face]["photo"], "gated": False,
+                              "candidates": [{"group": 0, "score": 2.5}, {"group": 1, "score": 1.0}]}],
+                            [{"groups": [0, 2], "score": .67}], [2])
+    report = missing_breakdown(run, result, similarity, ["A", "B"])
+    a = report["per_person"]["A"]
+    assert a["photos"] == 17 and a["found_in_main_group"] == 10 and a["in_own_fragment"] == 3
+    assert a["single_face_in_other_person_group"] == 1 and a["single_face_in_review"] == 1
+    assert a["group_photo_not_found"] == 1 and a["no_usable_face"] == 1
+    assert sum(a[cause] for cause in ("found_in_main_group", "in_own_fragment", "single_face_in_review", "single_face_in_other_person_group",
+                                      "group_photo_not_found", "no_usable_face")) == 17
+    assert report["causes"]["found_in_main_group"]["photos"] == 18 and report["photos"] == 25
+    entry = report["fragments"]["largest"][0]
+    assert entry["group"] == 2 and entry["missing_photos"] == 3 and entry["from_leftovers"] and entry["main_is_best_partner"]
+    assert entry["suggestion_rank"] == 1 and abs(entry["score_to_main"] - .5 / math.sqrt(.7 * .8)) < 1e-3
+    assert report["fragments"]["photos_with_pair_in_suggestions"] == 3
+    joins = {row["threshold"]: row for row in report["fragment_joins"]}
+    assert joins[.3]["joins_same_person"] == 1 and joins[.3]["joins_different_people"] == 0 and joins[.3]["photos_into_main_group"] == 3
+    rows = {(row["band"], row["first_candidate"]): row["photos"] for row in report["review_faces"]}
+    assert rows[("2 to 3", "main group")] == 1 and rows[("all", "main group among the candidates")] == 1

@@ -28,7 +28,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .photo_grouping import UNGROUPED, GroupingPolicy, GroupingResult, add_leftover_groups, agglomerate, apply_cluster_merges, cut, \
+from .photo_grouping import UNGROUPED, ClusterSums, GroupingPolicy, GroupingResult, add_leftover_groups, agglomerate, apply_cluster_merges, cut, \
     attach_to_new_groups, existing_group_scores, finish_grouping, fused_similarity, gate_mask, group_faces, group_means, \
     initial_groups, known_cluster_scores, leftover_merges, mean_ratios, merge_clusters, same_photo_constraints, square_block, top_k_means
 from .photos import RunData
@@ -1155,3 +1155,201 @@ def identification_report(run: RunData, model: str, enroll_sizes: Iterable[int] 
     return {"model": model, "people": len(names), "faces": int(len(keep)), "repeats": repeats, "top_m": top_m, "margin": margin,
             "max_wrong_rate": max_wrong_rate, "enroll_sizes": sizes,
             "note": "Threshold chosen on the same people it is measured on, and gallery photos may be near-duplicates of queries: optimistic."}
+
+
+# ------------------------------------------------------- where missing photos go
+
+MISSING_CAUSES = ("no_usable_face", "found_in_main_group", "in_own_fragment", "single_face_in_review",
+                  "single_face_in_other_person_group", "group_photo_not_found")
+FRAGMENT_SIZES = ((2, 2), (3, 5), (6, 20), (21, None))
+
+
+def _band(value: float, edges: tuple[float, ...]) -> str:
+    """Name of the band that holds ``value``; edges are sorted lower bounds after the first band."""
+    if not math.isfinite(value):
+        return "none"
+    for index, edge in enumerate(edges):
+        if value < edge:
+            return f"< {edges[0]:g}" if index == 0 else f"{edges[index - 1]:g} to {edge:g}"
+    return f">= {edges[-1]:g}"
+
+
+def _size_band(size: int) -> str:
+    for low, high in FRAGMENT_SIZES:
+        if size >= low and (high is None or size <= high):
+            return f"{low}" if low == high else (f"{low}+" if high is None else f"{low}-{high}")
+    return "other"
+
+
+def missing_breakdown(run: RunData, result: GroupingResult, similarity: np.ndarray, people: Iterable[str],
+                      labels: np.ndarray | None = None, photos: dict[int, str] | None = None,
+                      join_thresholds: tuple[float, ...] = (0.0, 0.1, 0.15, 0.2, 0.25, 0.3)) -> dict:
+    """Where each labelled photo of the given people went, and what each kind of fix could recover.
+
+    Each labelled photo gets one cause, checked in this order:
+    ``no_usable_face``; ``found_in_main_group``; ``in_own_fragment`` (a face is
+    in another group led by the same person); ``single_face_in_review``;
+    ``single_face_in_other_person_group`` (mixing); ``group_photo_not_found``
+    (several faces, none in the person's groups).
+
+    Fragments are the person's other groups, with the merge-suggestion score
+    (normalized cross score) to the main group, whether the main group is the
+    fragment's best-scoring partner, the best score to a group led by another
+    labelled person, and the rank of the pair among the merge suggestions.
+
+    ``fragment_joins`` estimates a rule that joins every group to its
+    best-scoring partner when the score reaches a threshold: pairs led by the
+    same person, by different people (wrong joins), or with a group that has
+    no labelled face (unknown), and the photos it would bring into main groups.
+
+    ``review_faces`` classifies the first candidate group of each single-face
+    review photo (main group, another group of the person, another person's
+    group, group without labelled faces) by score band around the attach
+    threshold.
+    """
+    labels = face_labels(run) if labels is None else labels
+    photos = photo_labels(run) if photos is None else photos
+    focus = set(people)
+    group_of = np.asarray(result.labels)
+    _, majority = _majorities(group_of, labels)
+    face_photo = np.asarray(run.face_photo, np.int64)
+    order = np.argsort(face_photo, kind="stable")
+    bounds = np.searchsorted(face_photo[order], np.arange(len(run.photos) + 1))
+    review_of = {item["face"]: item for item in result.review}
+    new_groups = set(result.leftover_groups)
+    photos_of: dict[str, list[int]] = defaultdict(list)
+    for photo, person in photos.items():
+        if person in focus:
+            photos_of[person].append(photo)
+
+    grouped = np.flatnonzero(group_of != UNGROUPED)
+    if len(grouped):
+        sums = ClusterSums(similarity, same_photo_constraints(face_photo), group_of[grouped], grouped)
+        pair = sums.scores(2)
+        position = {int(value): index for index, value in enumerate(sums.values)}
+        values = np.asarray(sums.values, np.int64)
+    else:
+        pair, position, values = np.zeros((0, 0)), {}, np.zeros(0, np.int64)
+    rank_of = {tuple(sorted(item["groups"])): rank for rank, item in enumerate(result.suggestions, 1)}
+    led_by = np.asarray([majority.get(int(value)) for value in values], dtype=object)
+
+    def pair_score(left: int, right: int) -> float:
+        return float(pair[position[left], position[right]])
+
+    threshold = result.policy.attach_threshold if result.policy.attach_threshold is not None else 0.0
+    review_edges = (threshold - 2, threshold - 1, threshold)
+    totals = Counter()
+    per_person = {}
+    fragments = {}
+    review_rows = Counter()
+    main_of = {}
+    for person in sorted(focus):
+        present, counts = np.unique(group_of[(group_of != UNGROUPED) & (labels == person)], return_counts=True)
+        main = int(present[np.argmax(counts)]) if len(present) else None
+        main_of[person] = main
+        own = {int(group) for group in present if majority.get(int(group)) == person}
+        tally = Counter()
+        for photo in photos_of[person]:
+            rows = order[bounds[photo]:bounds[photo + 1]]
+            here = {int(group) for group in group_of[rows] if group != UNGROUPED}
+            if not len(rows):
+                cause = "no_usable_face"
+            elif main is not None and main in here:
+                cause = "found_in_main_group"
+            elif here & own:
+                cause = "in_own_fragment"
+                fragment = min(here & own)
+                entry = fragments.setdefault(fragment, {"person": person, "group": fragment, "size": result.group_sizes[fragment],
+                                                        "from_leftovers": fragment in new_groups, "missing_photos": 0})
+                entry["missing_photos"] += 1
+            elif len(rows) == 1:
+                if here:
+                    cause = "single_face_in_other_person_group"
+                else:
+                    cause = "single_face_in_review"
+                    item = review_of.get(run.faces[int(rows[0])]["id"], {"candidates": []})
+                    candidates = item["candidates"]
+                    if not candidates:
+                        kind, band, lead_ok = "no candidate", "none", None
+                    else:
+                        top = int(candidates[0]["group"])
+                        kind = ("main group" if top == main else "another group of the person" if top in own
+                                else "group led by another person" if majority.get(top) is not None else "group without labelled faces")
+                        band = _band(float(candidates[0]["score"]), review_edges)
+                        lead = candidates[0]["score"] - candidates[1]["score"] if len(candidates) > 1 else math.inf
+                        lead_ok = lead >= result.policy.attach_margin
+                    review_rows[(band, kind)] += 1
+                    if band.startswith(">=") and lead_ok is False:
+                        review_rows[(band, "of these, lead below the margin")] += 1
+                    if main is not None and any(int(candidate["group"]) == main for candidate in candidates):
+                        review_rows[("all", "main group among the candidates")] += 1
+            else:
+                cause = "group_photo_not_found"
+            tally[cause] += 1
+        totals.update(tally)
+        total = len(photos_of[person])
+        per_person[person] = {**{cause: int(tally[cause]) for cause in MISSING_CAUSES}, "photos": total,
+                              "main_group_size": result.group_sizes[main] if main is not None else 0, "groups_led": len(own),
+                              "missing_rate": _ratio(total - tally["found_in_main_group"], total)}
+
+    for entry in fragments.values():
+        group, main = entry["group"], main_of[entry["person"]]
+        if group not in position:
+            continue
+        row = pair[position[group]]
+        best = int(np.argmax(row)) if len(row) else None
+        others = np.asarray([name is not None and name != entry["person"] for name in led_by])
+        entry["score_to_main"] = round(pair_score(group, main), 4) if main in position and math.isfinite(pair_score(group, main)) else None
+        entry["main_is_best_partner"] = best is not None and int(values[best]) == main and math.isfinite(row[best])
+        best_other = float(row[others].max()) if others.any() else -math.inf
+        entry["best_score_to_another_person"] = round(best_other, 4) if math.isfinite(best_other) else None
+        entry["suggestion_rank"] = rank_of.get(tuple(sorted((group, main)))) if main is not None else None
+
+    fragment_list = sorted(fragments.values(), key=lambda item: -item["missing_photos"])
+    by_size, by_score = Counter(), Counter()
+    for entry in fragment_list:
+        by_size[(_size_band(entry["size"]), entry["from_leftovers"])] += entry["missing_photos"]
+        score = entry.get("score_to_main")
+        by_score[_band(score if score is not None else -math.inf, join_thresholds[1:])] += entry["missing_photos"]
+    in_suggestions = sum(entry["missing_photos"] for entry in fragment_list if entry.get("suggestion_rank"))
+
+    joins = []
+    if len(values) > 1:
+        best = np.argmax(pair, axis=1)
+        best_score = pair[np.arange(len(values)), best]
+        sizes = np.asarray(result.group_sizes)
+        # The smaller group joins; of two equal groups, the one with the higher id.
+        smaller = (sizes[values] < sizes[values[best]]) | ((sizes[values] == sizes[values[best]]) & (values > values[best]))
+        for value in join_thresholds:
+            chosen = np.flatnonzero((best_score >= value) & np.isfinite(best_score) & smaller)
+            same = different = unknown = recovered = 0
+            for index in chosen:
+                left, right = led_by[index], led_by[best[index]]
+                if left not in focus and right not in focus:
+                    continue
+                if left is None or right is None:
+                    unknown += 1
+                elif left == right:
+                    same += 1
+                    entry = fragments.get(int(values[index]))
+                    if entry is not None and int(values[best[index]]) == main_of.get(entry["person"]):
+                        recovered += entry["missing_photos"]
+                else:
+                    different += 1
+            joins.append({"threshold": value, "joins_same_person": same, "joins_different_people": different,
+                          "joins_with_unlabelled_group": unknown, "photos_into_main_group": recovered})
+
+    total_photos = sum(totals.values())
+    return {"people": sorted(focus), "photos": total_photos,
+            "causes": {cause: {"photos": int(totals[cause]), "share": _ratio(totals[cause], total_photos)} for cause in MISSING_CAUSES},
+            "per_person": per_person,
+            "fragments": {"groups": len(fragment_list), "missing_photos": int(totals["in_own_fragment"]),
+                          "photos_with_pair_in_suggestions": int(in_suggestions),
+                          "photos_by_size": {f"{size}{' (from leftovers)' if leftover else ''}": count
+                                             for (size, leftover), count in sorted(by_size.items())},
+                          "photos_by_score_to_main": dict(sorted(by_score.items())),
+                          "largest": fragment_list[:40]},
+            "fragment_joins": joins,
+            "review_faces": [{"band": band, "first_candidate": kind, "photos": count} for (band, kind), count in sorted(review_rows.items())],
+            "note": "Group-pair scores are the merge-suggestion scores. Joins are counted for groups led by the given people only; "
+                    "groups without labelled faces cannot be judged."}
