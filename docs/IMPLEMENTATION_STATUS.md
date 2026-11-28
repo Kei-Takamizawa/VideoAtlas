@@ -52,6 +52,19 @@ Checked on November 26, 2026 UTC in an Ubuntu 26.04 container with an NVIDIA RTX
 - Single-image FACE01 pair scores over those faces: 665,245 same-person and 3,887,408 different-person pairs. AUC was **0.756**. The median same-person score was 0.163; the median different-person score was 0.060. At 0.50, precision was 88.4%, recall 2.6%, and the false-positive rate 0.06%. Six different-folder pairs scored at least 0.95: four were byte-identical files stored under two people, and two were near-duplicates. Recall with zero false positives was therefore 0.
 - These are score-only results without AdaFace or the multi-sample HIGH policy. They do not establish grouping accuracy, but they show that single FACE01 embeddings separate these people weakly.
 
+## Photo grouping by person (experimental)
+
+The `photos` commands (`analyze`, `verify`, `calibrate`, `group`, `strangers`) group still photos by person outside the video pipeline and write a groups file for the browser GUI. The GUI does not read it yet. The chosen policy is `videoatlas/photo_policies/setting-a.json`: glintr100 and LVFace-B with mirrored faces, fused; JAPANESE FACE V1 is analyzed but not used for grouping. The candidate models have non-commercial licences.
+
+Measured on November 27, 2026 UTC on the server GPU, with 42 labelled people (28,279 photos, 34,607 usable faces; analysis 1,468 s). The 14 people added last were not used for any choice and were looked at once:
+
+- 14 unused people: mixed faces 12 of 6,871 (0.17%), missing photos 4.81%. One person with 61 photos was split over 20 small groups (77% missing).
+- 28 earlier people in the same run: mixed 0.03%, missing 4.57%.
+- 26 hard look-alike photos: none in another person's group.
+- New people with 1 / 3 / 10 / 30 photos: 14.3% / 11.9% / 5.0% / 1.8% of their photos stayed in a group led by another person.
+
+These numbers come from about 42 people and do not establish accuracy on other photo collections. Details and limits: [the photo grouping evaluation](photo-grouping-evaluation.md).
+
 ## Supplied real-video evaluation
 
 The supplied collection contains 20 videos, 407.02 seconds in total. Filenames provide an offline answer key only after inference. One expected-subject track per video was selected from a visually inspected gallery; companions remain in the application but are excluded from this labelled cohort. There are 190 unordered video pairs: 30 same-person and 160 different-person pairs.

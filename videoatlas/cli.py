@@ -2,6 +2,7 @@
 
     python -m videoatlas.cli doctor [--device cuda|auto|cpu]
     python -m videoatlas.cli images ROOT --output DIR [--device cuda|auto|cpu]
+    python -m videoatlas.cli photos analyze|verify|calibrate|group ...
 
 ``--device cuda`` (the default) stops with an error when any model cannot run on
 the GPU, instead of silently using the CPU. ``auto`` allows a logged CPU fallback.
@@ -167,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
     images.add_argument("root", type=Path, help="photo folder, optionally with one subfolder per person")
     images.add_argument("--output", type=Path, required=True, help="new folder for faces.jsonl, embeddings.npz, and report.json")
     images.add_argument("--limit", type=int, help="analyze only the first N images")
+    from .photo_cli import add_photo_commands
+    add_photo_commands(commands, common)
     return parser
 
 
@@ -175,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=args.log_level, format="%(levelname)s %(name)s: %(message)s")
     handlers = {"doctor": cmd_doctor, "images": cmd_images}
     try:
-        return handlers[args.command](args)
+        return args.handler(args) if args.command == "photos" else handlers[args.command](args)
     except (RuntimeError, ValueError, FileNotFoundError, FileExistsError, NotADirectoryError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

@@ -1,0 +1,192 @@
+# Photo grouping evaluation (2026-11-26)
+
+This note records how the photo grouping was measured on labelled photos and what the measurements show. It is evidence for choosing a grouping policy, not a guarantee for other photo collections.
+
+## Data and hardware
+
+- 8 people, one folder per person, 4,615 photos after removing two duplicate pairs that were filed under two people. 4,603 photos count in the answer key.
+- Ubuntu server, RTX 4060 Ti 8 GB. Every model ran on CUDA (`--device cuda`, no CPU fallback). Analysis of all photos with five models took 4 min 40 s (16.5 photos/s); peak GPU memory was 2.3 GB.
+- Calibration runs on the CPU and took 1 to 15 minutes per setting set.
+
+## How errors are counted
+
+- **Mixing**: faces in a group whose majority is another person, divided by all labelled faces in groups.
+- **Missing**: labelled photos that are not in their person's main group (largest group of that person). This includes photos without a usable face, photos left for review, and photos in a second group of the same person.
+- **Held-out (leave-one-person-out)**: for each person in turn, settings are chosen on the other seven people under a mixing limit, then all photos are grouped together and only errors that involve the held-out person are counted. A mixing event between two people is counted in both of their folds.
+- **After review**: a simulated user answers the first N merge suggestions correctly, using the answer key. It assumes perfect answers.
+
+## Model comparison (single-face pairs, 3,862 faces)
+
+| Model | AUC | TAR at FMR 1e-3 (95% CI over people) |
+| --- | --- | --- |
+| glintr100 + LVFace-B (fused score) | 0.986 | 79.6% (70.0–90.4) |
+| glintr100 | 0.984 | 77.3% (68.7–88.7) |
+| w600k_r50 | 0.980 | 71.4% (59.9–84.0) |
+| LVFace-B | 0.980 | 70.5% (57.1–84.3) |
+| JAPANESE FACE V1 | 0.764 | 3.8% (1.2–12.8) |
+
+Faces with an eye distance under 15 px are much harder for every model (AUC about 0.91 to 0.92 for the ArcFace-family models).
+
+## Grouping results (held-out)
+
+| Round | Setting | Mixing limit on training people | Held-out mixing | Held-out missing | Missing after 100 suggestions |
+| --- | --- | --- | --- | --- | --- |
+| 1 | JAPANESE FACE V1, first step only | 0.2% | 3.28% | 96% | – |
+| 1 | glintr100, first step only | 0.2% | 1.29% (50 faces) | 22.4% | – |
+| 2 | fused, cluster merge (clusters of 3+) | any | 0.00% (0 of 3,857) | 26.4% | 10.7% |
+| 3 | fused, cluster merge (clusters of 2+) | 0.1% | 0.10% (4) | 10.6% | 7.1% |
+| 4 | fused, stricter first step (merge 5–9) | 0.05% | 0.16% (6) | 5.95% | 3.8% |
+| 4 | same | 0.1% | **6.13% (244)** | 3.91% | 2.1% |
+| 5 | fused, merge 8–12, no size cap | 0.05% | 0.18% (7) | 2.11% | 1.7% |
+| 5 | same | 0.5% | **3.36% (134)** | 1.76% | 1.7% |
+| 5 | fused, merge 8–12, size cap 30 | 0.05% | 0.34% (13) | 2.02% | 1.7% |
+| 5 | same | 0.5% | 0.49% (19) | 1.61% | 1.7% |
+| 6 | fused, size cap 30, attach down to 0.5 | 0.05% | 0.39% (15) | 1.96% | 1.6% |
+
+What the rounds show:
+
+- Most missing photos in rounds 1 and 2 were in a second group of the same person (makeup, age, lighting). A strict first step followed by the normalized cluster merge removes most of that split.
+- In round 4, a permissive setting merged all 119 faces of one person into the 555-face group of a similar-looking person. The training people could not reveal this risk: when one of the two look-alike people is held out, the other one has no look-alike among the training people. Round 5 shows the same jump without a safeguard (3.36% mixing).
+- `cluster_auto_max_size` stops two large clusters from merging automatically; such pairs become merge suggestions. With a cap of 30, mixing stayed at or below 0.70% for every mixing limit tried, and no whole person was merged. At strict limits the cap did not reduce mixing (0.34% with the cap against 0.18% without it at the 0.05% limit, a difference of 6 faces).
+- The remaining mixed faces are single faces or pairs, mostly between SeoAh, JooBin, SeoYeon and Hitomi. Some may be filing errors in the answer key; 26 such photos were sent to the user for checking.
+
+## Candidate policy
+
+Chosen on all 8 people at a mixing limit of 0.05% (round 6): fused glintr100 + LVFace-B, first-step merge 10.0 (fused units: spread of different-person scores), cluster merge 0.3 on clusters of 2 or more faces, automatic merge only when the smaller cluster has 30 faces or fewer, attach 0.75 with margin 0.05 over the top 5 faces, merge suggestions from 0.2.
+
+On all 8 people (optimistic, because the same people chose it): 122 groups, the 8 largest match the 8 people; 230 faces left for review in 130 photos; 94 merge suggestions; 1 mixed face (0.03%); missing 2.48% (1.71% without the photos that have no usable face).
+
+## Test on 20 new people (2026-11-27)
+
+The user added 20 labelled people (15,415 files). None of them was used in rounds 1 to 6. The candidate policy above was applied without any change to all 28 people together (20,028 photos read, 24,398 usable faces, 2,788 photos with two or more usable faces). Only errors that involve the 20 new people are counted.
+
+- Before any further tuning, the 20 new people were split at random (SHA-256 of a fixed seed and the name) into 10 development people and 10 test people. The test people are kept out of every choice that follows.
+- Analysis on CUDA with six models (four, plus mirrored-face averaging for two of them): 31 min 12 s (10.7 photos/s), peak GPU memory 5,777 MiB for the whole device. Grouping 24,398 faces: 20 s, 5.9 GiB of RAM.
+
+| People | Labelled faces in groups | Mixed faces | Missing photos | Missing after 200 suggestions |
+| --- | --- | --- | --- | --- |
+| 20 new people | 13,159 | 9 (0.07%) | 6.48% of 15,024 | 4.57% |
+| 10 test people | 4,987 | 3 (0.06%) | 6.95% of 5,684 | 4.52% |
+| All 28 people | 17,002 | 10 (0.06%) | 5.54% of 19,533 | 3.97% |
+
+- Mixing: 8 groups hold faces of two people, each with one or two faces of the other person. No person was merged as a whole.
+- Missing: 832 of the 974 missing photos of the new people are in a second large group of the same person (for example 481 + 142, 635 + 321, 525 + 256 faces). Such pairs are larger than the automatic-merge cap of 30 faces, so they can only become merge suggestions. The review simulation shows that these suggestions are ranked between 100 and 200, behind many suggestions between small groups.
+- The 26 hard photos the user confirmed as correctly filed (look-alike people): 23 are in their own person's main group, 2 are left for review with their own person as the first candidate, and 1 is in another person's group.
+
+Model comparison on the 18 people outside the test set (12,039 single faces, paired person bootstrap, difference in TAR at FMR 1e-3 against glintr100):
+
+| Model | AUC | TAR at FMR 1e-3 | Difference (95% CI) |
+| --- | --- | --- | --- |
+| glintr100 | 0.978 | 72.9% | reference |
+| glintr100 + LVFace-B (fused) | 0.982 | 74.4% | +1.5 (-1.1 to +3.6) |
+| both with mirrored-face averaging, fused | 0.982 | 76.7% | +3.8 (+1.7 to +5.5) |
+| w600k_r50 + both mirrored, fused | 0.982 | 76.8% | +4.0 (+2.1 to +5.3) |
+| both after WCCN, fused | 0.988 | 73.4% | +0.6 (-3.8 to +13.7) |
+| JAPANESE FACE V1 (all 28 people) | 0.760 | 4.7% | – |
+
+WCCN raised the AUC but not the true-accept rate at a low false-match rate, which is the range that matters for grouping, so it is not used.
+
+## Newcomers with few photos (2026-11-27)
+
+The answer key only holds people with hundreds of photos, so it cannot show what happens to a person who appears in one or a few photos. `photos strangers` removes a batch of five labelled people except one or three of their photos each, groups the rest of the collection unchanged, and counts kept faces that land in a group led by another labelled person.
+
+| Policy | People | 1 photo kept | 3 photos kept |
+| --- | --- | --- | --- |
+| Candidate policy above (attach 0.75) | 18 development | 29 of 54 in another person's group | 83 of 162 |
+| same | 10 test | 11 of 30 (36.7%) | 38 of 90 (42.2%) |
+| New policy (below) | 18 development | 0 of 54 | 0 of 162 |
+| same | 10 test | 1 of 30 (3.3%) | 1 of 90 (1.1%) |
+
+Almost all of these errors came from the attach step: a top-5 score lets a face join a look-alike's group through a few close faces. The new policy adds two things, both chosen on the development people only:
+
+- `attach_min_ratio`: an attached face's mean score to the whole group must reach a share (0.6) of the group's own mean pair score.
+- Calibration estimates, for every setting, the share of each tuning person's faces that the attach step would put into another person's group if that person had no group yet, and keeps settings at or below 1% (`--newcomer-limit 0.01`).
+
+The new policy uses the mirrored-face models (glintr100+flip and LVFace-B+flip, fused): merge 10.5, cluster merge 0.3 with the size cap of 30, attach 4.0 with margin 0.05 and ratio 0.6.
+
+Final check on the 10 test people (never used for any choice before this check):
+
+| Policy | Mixed faces | Missing photos | Hard look-alike photos (26) |
+| --- | --- | --- | --- |
+| Candidate policy above | 3 of 4,987 (0.06%) | 6.95% | 23 own group, 2 review, 1 wrong |
+| New policy | 66 of 4,792 (1.38%) | 5.21% | 22 own group, 4 review, 0 wrong |
+
+All 66 mixed faces are in one group: the ChaeWon group (688 faces) took 49 Serina faces and 17 Wonyoung faces, and no group is led by Serina. Serina's faces did not form a large cluster in the first step, so those small clusters joined the look-alike group one by one, each below the size cap. The development people could not show this, because ChaeWon and Serina were both hidden test people. This is the same kind of failure as the whole-person merge in round 4. A whole-cluster check for the cluster merge (`cluster_min_ratio`) is being tuned on the development people. Because the test people have now been seen, the next test result will be somewhat optimistic; an unbiased estimate needs new labelled people.
+
+## Whole-cluster check in the cluster merge (2026-11-27)
+
+`cluster_min_ratio` blocks a cluster merge unless the mean score between the two clusters reaches a share of the larger cluster's own mean pair score. A piece of a look-alike person is close to a few faces of the big group, but not to the group as a whole, so its ratio stays low. The value 0.5 was chosen on the development people only (mixing 0.017%, missing 5.09%, newcomer estimate 0.89%). Calibration with this check also changed the attach threshold: the resulting policy (`policy-dev-open2.json`) uses merge 10.5, cluster merge 0.3 with the size cap of 30, cluster ratio 0.5, and attach 3.0 with margin 0.05 and ratio 0.6.
+
+Second check on the 10 test people. This is the second time these people were looked at, and the failure seen in the first check guided this change, so these numbers are somewhat optimistic:
+
+| Policy | Mixed faces | Missing photos | Newcomers in another person's group (1 / 3 / 10 / 30 photos kept) | Hard look-alike photos (26) |
+| --- | --- | --- | --- | --- |
+| Candidate policy above | 3 of 4,987 (0.06%) | 6.95% | 36.7% / 42.2% / - / - | 23 own group, 2 review, 1 wrong |
+| Attach safeguards only | 66 of 4,792 (1.38%) | 5.21% | 3.3% / 1.1% / - / - | 22 own group, 4 review, 0 wrong |
+| Attach safeguards and `cluster_min_ratio` 0.5 | 1 of 4,877 (0.02%) | 3.20% | 3.3% / 1.1% / 1.3% / 1.6% | 22 own group, 4 review, 0 wrong |
+
+ChaeWon and Serina now lead separate groups, and neither group holds another labelled person. The two merges that caused the earlier mixing (ratios 0.43 and 0.32) are blocked.
+
+One problem remains. A newcomer rarely gets a group of their own: with 30 photos kept, only 6 of 900 kept faces were in a group of their own, and almost all others stayed in review. The first clustering step joins only near-duplicate faces, and the attach step (correctly) keeps newcomers out of other groups.
+
+## New groups from leftover faces (2026-11-27)
+
+An optional step clusters the faces that no group took among themselves, with average linkage at a lower threshold (`leftover_merge_threshold`), and keeps clusters of at least `leftover_min_size` faces as new groups. The groups file marks them with `from_leftovers`, so the user can check them first. `Scripts/sweep_leftover_groups.py` compares settings on the development people: mixing and missing for known people, and the newcomer test with 1, 3, 10 and 30 photos kept.
+
+First sweep (18 development people, test labels hidden; newcomer columns in % of kept faces, own group / another person's group / unlabelled group):
+
+| Threshold, min size | Known people: mixed faces | 1 photo kept | 3 kept | 10 kept | 30 kept |
+| --- | --- | --- | --- | --- | --- |
+| off | 2 | 0 / 0 / 0 | 1.2 / 0 / 0 | 0 / 0.6 / 0.4 | 2.2 / 0.6 / 0.1 |
+| 5.0, 2 | 2 | 0 / 3.7 / 22.2 | 22.2 / 5.6 / 24.1 | 41.5 / 4.3 / 20.4 | 52.7 / 5.9 / 18.6 |
+| 6.0, 2 | 2 | 0 / 1.9 / 1.9 | 7.4 / 3.7 / 6.2 | 25.0 / 2.2 / 4.1 | 41.0 / 2.7 / 3.5 |
+| 7.0, 2 | 2 | 0 / 0 / 0 | 2.5 / 0.6 / 1.9 | 3.7 / 0.9 / 0.9 | 14.2 / 0.6 / 0.8 |
+
+Known people were not affected at 3.5 and above (no mixed face in a new group). For newcomers the step works, but it also puts more of them in a group with other faces. "Unlabelled group" counts as wrong here, although the unlabelled faces can be the same newcomer seen in group photos of other folders. Second sweep (60 settings): a check that keeps a leftover cluster out when it is about as close to an existing group as two pieces of one person usually are (`leftover_max_known_score`) removed correct new groups about as often as wrong ones, so it is not used. An estimate of who the unlabelled faces are (the labelled person with the highest mean score, by a lead of at least 1.0) suggested that 154 of 159 "unlabelled group" placements (30 photos kept) were the newcomer's own faces in other folders' group photos. The estimate uses the same models, so it is not an answer key. Real wrong placements came mostly from one look-alike pair.
+
+Third sweep: `leftover_attach` lets remaining faces join a new group under the main attach rules. It doubled the newcomers' own-group share at 30 photos (14.2% to 31.6%) but raised the share in another person's group to 3.7% / 1.9% / 2.0% / 0.7% (1 / 3 / 10 / 30 photos kept), against 0% / 0.6% / 0.6% / 0.4% without it.
+
+The user chose setting A before the final check: threshold 7.0, minimum size 2, no known-group limit, no attach to new groups (`policy-final-a.json` = `policy-dev-open2.json` plus these four fields).
+
+## Final check on 14 unused people (2026-11-27)
+
+The user added 14 labelled people (8,251 files) after all settings above were chosen. They were analyzed together with the 28 earlier people (42 people, 28,279 photos, 34,607 usable faces; 1,468 s on the GPU) and looked at once, with setting A fixed beforehand. This is the first unbiased estimate since the 8-person rounds.
+
+| People | Mixed faces | Missing photos | Notes |
+| --- | --- | --- | --- |
+| 14 unused people | 12 of 6,871 (0.17%), 4 groups | 4.81% (4.25% without photos that have no usable face) | Kumi (61 photos) misses 77%: the faces are split over 20 small groups |
+| 28 earlier people, same run | 5 of 16,849 (0.03%), 3 groups | 4.57% | |
+
+The 26 hard look-alike photos: 22 in the person's main group, 4 (SeoYeon) in two new two-face groups that hold only SeoYeon's faces, none in another person's group.
+
+The newcomer test on the 14 unused people shows a problem that the development people did not show:
+
+| Policy | 1 photo kept | 3 kept | 10 kept | 30 kept |
+| --- | --- | --- | --- | --- |
+| Without new groups (own / another person's / unlabelled, %) | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 1.0 / 11.7 / 6.9 | 3.5 / 14.9 / 8.6 |
+| Setting A | 0 / 14.3 / 7.1 | 0 / 16.7 / 6.3 | 5.7 / 11.7 / 6.9 | 14.7 / 14.9 / 8.6 |
+
+Setting A works as intended: no wrong placement was in a new group, and the newcomers' own-group share at 30 photos rose from 3.5% to 14.7%.
+
+The "another person's" column first looked like a large failure: 12% to 17%, mostly in groups whose labelled faces were Juun's or Yuha's. `Scripts/explain_newcomer_errors.py` showed that the test itself was misleading. The newcomer test named a group by its labelled faces only. When Ian was a newcomer, 28 of 30 kept faces went into a group of 105 faces: the 28 kept faces, about 67 faces estimated to be Ian from other folders' group photos, and only 4 labelled faces (Juun 2, Stella 2), so the test called it Juun's group. Juun as a newcomer behaved the same way, except that the group also took 16 labelled faces of Yuha (10), A-na (5) and YeonJi (1). The main Juun and Yuha groups held only their own faces in every run. The test now also counts placements whose group holds more of the newcomer's kept faces than of any labelled person:
+
+| Photos kept | Another person's group by labelled faces | Of these, group led by the newcomer | Left in a group led by another person |
+| --- | --- | --- | --- |
+| 1 | 6 of 42 (14.3%) | 0 | 14.3% |
+| 3 | 21 of 126 (16.7%) | 6 | 11.9% |
+| 10 | 49 of 420 (11.7%) | 28 | 5.0% |
+| 30 | 188 of 1,260 (14.9%) | 165 | 1.8% |
+
+With 1 or 3 photos kept, the kept faces cannot outnumber a few labelled faces, so most of these are the same kind of group (the newcomer's own group-photo faces plus a few labelled faces of someone else), going by the estimate; the estimate uses the same models and is not an answer key. On the development people the same measure is 3.7% / 1.9% / 0.6% / 0.7%.
+
+The remaining real errors are the labelled faces of known people that such newcomer groups take (for example the 16 Yuha, A-na and YeonJi faces), and a person with few photos being split into many small groups (Kumi). These 14 people are no longer unseen; another unbiased check needs new labelled people.
+
+The chosen policy is stored in the repository as [`videoatlas/photo_policies/setting-a.json`](../videoatlas/photo_policies/setting-a.json). It needs a run analyzed with `--models face01,glintr100+flip,lvface-b+flip`.
+
+
+## Limits of this evidence
+
+- 28 people now, 10 of them kept for testing. Confidence intervals over people are still wide, and the chance of meeting a look-alike pair grows with the number of people.
+- The settings grids for rounds 2 to 6 were widened after seeing held-out results. The held-out numbers are therefore somewhat optimistic. An unbiased estimate needs people who were not used in any round.
+- The review simulation assumes that the user answers every suggestion correctly.
+- The candidate models (glintr100, LVFace-B) have non-commercial licences. JAPANESE FACE V1 remains the specified primary model; the user decided to collect more labelled people before changing it.
