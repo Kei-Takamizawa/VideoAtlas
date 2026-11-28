@@ -31,6 +31,14 @@ evaluation on labelled photos chooses them (see ``photo_evaluation``).
    ``leftover_attach``, faces still left then get one more attach step with
    the new groups as targets, under the same rules as step 4 (the margin
    counts every group), so a new group can grow the way known groups do.
+   With ``leftover_join_threshold``, a whole new group then joins an existing
+   group when every one of its faces chooses that group: each face's attach
+   score (top-k mean) is highest for it and reaches the threshold, the new
+   group's mean score leads the next group by ``leftover_join_margin``, and,
+   with ``leftover_join_min_ratio``, its mean score to the whole group is at
+   least that share of the group's own mean pair score. Several faces that
+   agree are stronger evidence than one face, so hard photos of a known person
+   rejoin the person instead of staying a separate small group.
 6. Suggestions: group pairs whose normalized score reaches
    ``suggest_threshold`` are listed for the user to confirm or reject.
 
@@ -88,6 +96,11 @@ class GroupingPolicy:
     leftover_max_known_score: float | None = None
     # Let faces that are still left join a new group under the attach rules.
     leftover_attach: bool = False
+    # Join a whole new group to the existing group that all its faces choose
+    # (see step 5 in the module docstring).
+    leftover_join_threshold: float | None = None
+    leftover_join_margin: float = .05
+    leftover_join_min_ratio: float | None = None
     suggest_threshold: float | None = None
     max_suggestions: int = 200
     weights: tuple[float, ...] | None = None
@@ -118,7 +131,10 @@ class GroupingPolicy:
             raise ValueError("min_group_size must be at least 2 and attach_top_k at least 1")
         if not all(math.isfinite(value) for value in (self.merge_threshold, self.attach_margin, self.min_eye_distance)):
             raise ValueError("thresholds must be finite")
-        for name in ("attach_min_ratio", "cluster_min_ratio", "leftover_merge_threshold", "leftover_max_known_score"):
+        if not math.isfinite(self.leftover_join_margin):
+            raise ValueError("leftover_join_margin must be finite")
+        for name in ("attach_min_ratio", "cluster_min_ratio", "leftover_merge_threshold", "leftover_max_known_score",
+                     "leftover_join_threshold", "leftover_join_min_ratio"):
             if getattr(self, name) is not None and not math.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
 
@@ -497,7 +513,7 @@ class GroupingResult:
     face_ids: list[str]
     labels: np.ndarray                     # group index per face, or UNGROUPED
     group_sizes: list[int]
-    attached: np.ndarray                   # True for faces that joined a group in the attach step
+    attached: np.ndarray                   # True for faces that joined a group in the attach or join step
     gated: np.ndarray                      # True for faces that the gate kept out of automatic grouping
     review: list[dict]                     # faces left for review, with candidate groups
     suggestions: list[dict] = field(default_factory=list)  # group pairs that may be one person
@@ -681,6 +697,63 @@ def attach_to_new_groups(similarity: np.ndarray, linked, labels: np.ndarray, fac
     return labels, attached
 
 
+def join_new_groups(similarity: np.ndarray, constraints: np.ndarray, labels: np.ndarray, leftovers: np.ndarray,
+                    scores: np.ndarray | None, members: list[np.ndarray], new_groups: list[int],
+                    policy: GroupingPolicy) -> tuple[np.ndarray, list[int], np.ndarray]:
+    """Join whole new groups to the existing group that all their faces choose.
+
+    ``scores`` holds the attach scores (top-k means) of the ``leftovers`` faces
+    to the groups in ``members``, the groups formed before the attach step,
+    with -inf where a group is closed to a face. New groups must be the
+    highest group ids. Returns the labels, the remaining new group ids
+    (renumbered so that group ids stay contiguous), and a mask of the faces
+    that joined an existing group.
+    """
+    labels = labels.copy()
+    joined_faces = np.zeros(len(labels), bool)
+    if policy.leftover_join_threshold is None or not new_groups or scores is None or not scores.shape[1]:
+        return labels, list(new_groups), joined_faces
+    position = np.full(len(labels), -1, np.int64)
+    position[leftovers] = np.arange(len(leftovers))
+    within: dict[int, float] = {}
+    joined = set()
+    for group in new_groups:
+        faces = np.flatnonzero(labels == group)
+        if not len(faces) or (position[faces] < 0).any():
+            continue
+        rows = scores[position[faces]]
+        mean = rows.mean(axis=0)
+        best = int(np.argmax(mean))
+        if not math.isfinite(mean[best]) or (np.argmax(rows, axis=1) != best).any():
+            continue
+        if rows[:, best].min() < policy.leftover_join_threshold:
+            continue
+        if len(mean) > 1 and mean[best] - np.partition(mean, -2)[-2] < policy.leftover_join_margin:
+            continue
+        if constraints[np.ix_(faces, np.flatnonzero(labels == best))].any():
+            continue
+        if policy.leftover_join_min_ratio is not None:
+            if best not in within:
+                group_members = members[best]
+                block = np.asarray(similarity[np.ix_(group_members, group_members)], np.float64)
+                pairs = len(group_members) * (len(group_members) - 1)
+                within[best] = (block.sum() - np.trace(block)) / pairs if pairs else math.nan
+            cross = float(np.asarray(similarity[np.ix_(faces, members[best])], np.float64).mean())
+            if not (within[best] > 0 and cross / within[best] >= policy.leftover_join_min_ratio):
+                continue
+        labels[faces] = best
+        joined_faces[faces] = True
+        joined.add(group)
+    remaining = [group for group in new_groups if group not in joined]
+    if joined:
+        lookup = np.arange(max(new_groups) + 1)
+        lookup[remaining] = np.arange(min(new_groups), min(new_groups) + len(remaining))
+        grouped = labels != UNGROUPED
+        labels[grouped] = lookup[labels[grouped]]
+        remaining = lookup[remaining].tolist()
+    return labels, remaining, joined_faces
+
+
 def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray, constraints: np.ndarray,
                     rows: np.ndarray, local_labels: np.ndarray, cache: dict | None = None,
                     review_candidates: bool = True) -> GroupingResult:
@@ -750,6 +823,9 @@ def finish_grouping(run: RunData, policy: GroupingPolicy, similarity: np.ndarray
             labels, joined = attach_to_new_groups(similarity, lambda left, right: constraints[np.ix_(left, right)], labels,
                                                   pool, new_groups, policy)
             attached |= joined
+        labels, new_groups, joined = join_new_groups(similarity, constraints, labels, leftovers, scores, members, new_groups, policy)
+        attached |= joined
+        group_count = len(members) + len(new_groups)
     remaining = np.flatnonzero(labels[leftovers] == UNGROUPED)
     # Review candidates come from the groups formed before the attach step only.
     candidates: list[list[dict]] = [[] for _ in remaining]

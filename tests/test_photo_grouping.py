@@ -931,7 +931,8 @@ def test_shipped_policy_loads_and_keeps_its_safeguards():
     assert policy.models == ("glintr100+flip", "lvface-b+flip")
     assert policy.cluster_auto_max_size == 30 and policy.cluster_min_ratio == .5 and policy.attach_min_ratio == .6
     assert policy.leftover_merge_threshold == 7.0 and policy.leftover_min_size == 2 and not policy.leftover_attach
-    assert policy.to_json() == json.loads(path.read_text(encoding="utf-8"))
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert {key: policy.to_json()[key] for key in stored} == stored
 
 
 def test_missing_breakdown_names_the_cause_of_every_missing_photo():
@@ -975,3 +976,35 @@ def test_missing_breakdown_names_the_cause_of_every_missing_photo():
     assert joins[.3]["joins_same_person"] == 1 and joins[.3]["joins_different_people"] == 0 and joins[.3]["photos_into_main_group"] == 3
     rows = {(row["band"], row["first_candidate"]): row["photos"] for row in report["review_faces"]}
     assert rows[("2 to 3", "main group")] == 1 and rows[("all", "main group among the candidates")] == 1
+
+
+def test_a_new_group_whose_faces_all_choose_a_known_group_joins_it():
+    from videoatlas.photo_grouping import finish_grouping
+    count = 24
+    known, hard, newcomer, other = np.arange(0, 8), np.arange(8, 13), np.arange(13, 17), np.arange(17, 23)
+    similarity = np.zeros((count, count), np.float32)
+    similarity[np.ix_(known, known)] = similarity[np.ix_(other, other)] = .8
+    similarity[np.ix_(hard, hard)] = .6                     # hard photos of the known person
+    similarity[np.ix_(hard, known)] = similarity[np.ix_(known, hard)] = .45
+    similarity[np.ix_(newcomer, newcomer)] = .55
+    similarity[np.ix_(newcomer, known)] = similarity[np.ix_(known, newcomer)] = .05
+    np.fill_diagonal(similarity, 1.0)
+    run = make_run([1] * count, np.eye(count))
+    constraints = same_photo_constraints(run.face_photo)
+    local = np.asarray([0] * 8 + list(range(2, 11)) + [1] * 6 + [11])
+    policy = GroupingPolicy(("m",), merge_threshold=.7, attach_threshold=.6, leftover_merge_threshold=.5, leftover_min_size=3)
+    result = finish_grouping(run, policy, similarity, constraints, np.arange(count), local)
+    assert result.group_sizes == [8, 6, 5, 4] and result.leftover_groups == [2, 3]
+    joining = replace(policy, leftover_join_threshold=.4, leftover_join_min_ratio=.5)   # ratio .45 / .8 = .56
+    result = finish_grouping(run, joining, similarity, constraints, np.arange(count), local)
+    assert result.group_sizes == [13, 6, 4] and result.leftover_groups == [2]
+    assert (result.labels[hard] == 0).all() and (result.labels[newcomer] == 2).all() and result.attached[hard].all()
+    assert result.review == [{"face": run.faces[23]["id"], "photo": run.faces[23]["photo"], "gated": False,
+                               "candidates": result.review[0]["candidates"]}]
+    for strict in (replace(joining, leftover_join_min_ratio=.6), replace(joining, leftover_join_threshold=.5),
+                   replace(joining, leftover_join_margin=.5)):
+        assert finish_grouping(run, strict, similarity, constraints, np.arange(count), local).group_sizes == [8, 6, 5, 4]
+    blocked = constraints.copy()
+    blocked[8, 0] = blocked[0, 8] = True                    # the user said face 8 is not the known person
+    assert finish_grouping(run, joining, similarity, blocked, np.arange(count), local).group_sizes == [8, 6, 5, 4]
+    assert GroupingPolicy.from_json(joining.to_json()).leftover_join_threshold == .4
